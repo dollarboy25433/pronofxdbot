@@ -1,0 +1,97 @@
+
+> deriv-oauth-client@1.0.0 dev:all
+> concurrently "npm run server" "npm run dev"
+
+[0] 
+[0] > deriv-oauth-client@1.0.0 server
+[0] > nodemon server.js
+[0] 
+[1] 
+[1] > deriv-oauth-client@1.0.0 dev
+[1] > vite
+[1] 
+[1] NODE_ENV=DEVELOPMENT is not supported in the .env file. Only NODE_ENV=development is supported to create a development build of your project. If you need to set process.env.NODE_ENV, you can set it in the Vite config instead.
+[1] Port 5173 is in use, trying another one...
+[1] 
+[1]   [32m[1mVITE[22m v5.4.21[39m  [2mready in [0m[1m1130[22m[2m[0m ms[22m
+[1] 
+[1]   [32m➜[39m  [1mLocal[22m:   [36mhttp://localhost:[1m5174[22m/[39m
+[1] [2m  [32m➜[39m  [1mNetwork[22m[2m: use [22m[1m--host[22m[2m to expose[22m
+[0] [33m[nodemon] 3.1.14[39m
+[0] [33m[nodemon] to restart at any time, enter `rs`[39m
+[0] [33m[nodemon] watching path(s): *.*[39m
+[0] [33m[nodemon] watching extensions: js,mjs,cjs,json[39m
+[0] [32m[nodemon] starting `node server.js`[39m
+[0] Deriv backend running on http://localhost:4000
+[0] node:events:486
+[0]       throw er; // Unhandled 'error' event
+[0]       ^
+[0] 
+[0] Error: listen EADDRINUSE: address already in use :::4000
+[0]     at Server.setupListenHandle [as _listen2] (node:net:1940:16)
+[0]     at listenInCluster (node:net:1997:12)
+[0]     at Server.listen (node:net:2102:7)
+[0]     at app.listen (C:\Users\oyooo\pronofxdbot\node_modules\express\lib\application.js:605:24)
+[0]     at file:///C:/Users/oyooo/pronofxdbot/server.js:795:24
+[0]     at ModuleJob.run (node:internal/modules/esm/module_job:430:25)
+[0]     at process.processTicksAndRejections (node:internal/process/task_queues:104:5)
+[0]     at async onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:654:26)
+[0]     at async asyncRunEntryPointWithESMLoader (node:internal/modules/run_main:101:5)
+[0] Emitted 'error' event on WebSocketServer instance at:
+[0]     at Server.emit (node:events:520:22)
+[0]     at emitErrorNT (node:net:1976:8)
+[0]     at process.processTicksAndRejections (node:internal/process/task_queues:90:21) {
+[0]   code: 'EADDRINUSE',
+[0]   errno: -4091,
+[0]   syscall: 'listen',
+[0]   address: '::',
+[0]   port: 4000
+[0] }
+[0] 
+[0] Node.js v25.4.0
+[0] [31m[nodemon] app crashed - waiting for file changes before starting...[39m
+[0] [32m[nodemon] restarting due to changes...[39m
+[0] [32m[nodemon] starting `node server.js`[39m
+[0] [32m[nodemon] restarting due to changes...[39m
+[0] [32m[nodemon] starting `node server.js`[39m
+[0] Deriv backend running on http://localhost:4000
+[0] [32m[nodemon] restarting due to changes...[39m
+[0] [32m[nodemon] starting `node server.js`[39m
+[0] Deriv backend running on http://localhost:4000
+[0] [32m[nodemon] restarting due to changes...[39m
+[0] [32m[nodemon] starting `node server.js`[39m
+[0] Deriv backend running on http://localhost:4000
+[0] [32m[nodemon] restarting due to changes...[39m
+[0] [32m[nodemon] restarting due to changes...[39m
+[0] [32m[nodemon] starting `node server.js`[39m
+[0] Deriv backend running on http://localhost:4000
+[0] [32m[nodemon] restarting due to changes...[39m
+[0] [32m[nodemon] starting `node server.js`[39m
+[0] Deriv backend running on http://localhost:4000
+[0] [32m[nodemon] restarting due to changes...[39m
+[0] [32m[nodemon] starting `node server.js`[39m
+[0] Deriv backend running on http://localhost:4000
+[0] [32m[nodemon] restarting due to changes...[39m
+[0] [32m[nodemon] starting `node server.js`[39m
+[0] Deriv backend running on http://localhost:4000
+[0] [32m[nodemon] restarting due to changes...[39m
+[0] [32m[nodemon] starting `node server.js`[39m
+[0] Deriv backend running on http://localhost:4000
+[0] [32m[nodemon] restarting due to changes...[39m
+[0] [32m[nodemon] starting `node server.js`[39m
+[0] Deriv backend running on http://localhost:4000
+[0] [32m[nodemon] restarting due to changes...[39m
+[0] [32m[nodemon] starting `node server.js`[39m
+[0] Deriv backend running on http://localhost:4000
+[0] [32m[nodemon] restarting due to changes...[39m
+[0] [32m[nodemon] starting `node server.js`[39m
+[0] [32m[nodemon] restarting due to changes...[39m
+[0] [32m[nodemon] starting `node server.js`[39m
+[0] Deriv backend running on http://localhost:4000
+[0] [32m[nodemon] restarting due to changes...[39m
+[0] [32m[nodemon] starting `node server.js`[39m
+[0] [32m[nodemon] restarting due to changes...[39m
+[0] [32m[nodemon] restarting due to changes...[39m
+[0] Deriv backend running on http://localhost:4000
+[0] [32m[nodemon] starting `node server.js`[39m
+[0] Deriv backend running on http://localhost:4000
