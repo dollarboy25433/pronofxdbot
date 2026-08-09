@@ -804,14 +804,37 @@ const CLS_CSS = `
 .cls-quiz-submit { display: flex; align-items: center; gap: 12px; margin-top: 18px; }
 .cls-quiz-submit .section-sub { margin: 0; }
 
+@media (max-width: 760px) {
+  .cls-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+}
 @media (max-width: 600px) {
-  .cls-lesson-row { grid-template-columns: 18px 30px 1fr 16px; }
+  .cls-card-meta { flex-wrap: wrap; row-gap: 6px; }
+  .cls-card-head { flex-wrap: wrap; }
+  .cls-lesson-row { grid-template-columns: 18px 30px minmax(0, 1fr) 16px; }
   .cls-lesson-min { display: none; }
+  .cls-lesson-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .cls-lesson-body { padding: 16px; }
   .cls-quiz-card { flex-direction: column; align-items: flex-start; }
   .cls-result { flex-wrap: wrap; }
   .cls-cert-box { max-width: 100%; }
   .cls-detail-head { flex-direction: column; }
+  .cls-lesson-nav { flex-wrap: wrap; }
+  .cls-quiz-submit { flex-wrap: wrap; }
+}
+@media (max-width: 480px) {
+  .cls-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+  .cls-card { padding: 12px; gap: 8px; }
+  .cls-card-title { font-size: 13px; }
+  .cls-card-tagline { font-size: 11px; min-height: 0; line-height: 1.4; }
+  .cls-card-meta { gap: 4px 8px; font-size: 10px; }
+  .cls-card-head { gap: 6px; }
+  .cls-level { font-size: 9px; padding: 1px 6px; }
+  .cls-category { display: none; }
+  .cls-open { width: 100%; justify-content: center; padding: 7px 8px; font-size: 11px; }
+  .cls-lesson-body { padding: 14px; }
+  .cls-question { padding: 14px; }
+  .cls-quiz-submit .btn-primary { width: 100%; }
+  .cls-lesson-nav .btn-primary, .cls-lesson-nav .btn-outline { flex: 1; justify-content: center; }
 }
 `;
 

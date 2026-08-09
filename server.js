@@ -12,16 +12,14 @@
  *     token to open a WebSocket to Deriv's API and fetch account info/balance.
  */
 
-// Load .env into process.env (no dotenv dependency; Node 20.12+ built-in).
-try {
-  process.loadEnvFile('.env');
-} catch { /* .env missing or Node too old — rely on real env vars */ }
+import 'dotenv/config'; // loads .env into process.env
 
 import express from 'express';
 import cors from 'cors';
 import crypto from 'crypto';
 import WebSocket, { WebSocketServer } from 'ws';
 import path from 'path';
+import pg from 'pg';
 
 const app = express();
 app.use(cors({ origin: process.env.FRONTEND_URL || 'http://localhost:5173', credentials: true }));
@@ -30,6 +28,116 @@ app.use(express.json());
 const PORT = process.env.PORT || 4000;
 const DERIV_APP_ID = process.env.DERIV_APP_ID || '126958'; // used for WebSocket/API calls (Deriv-App-ID header + legacy WS)
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
+
+// ---------------------------------------------------------------
+// PostgreSQL (community data: users, activities, circles, bots,
+// copy-trading strategies). On Render set DATABASE_URL to your
+// instance's connection string. If it is missing the app still
+// runs — community endpoints return 503 until a DB is configured.
+// ---------------------------------------------------------------
+const DATABASE_URL = process.env.DATABASE_URL;
+const DB_HOST = process.env.DB_HOST;
+const DB_PORT = process.env.DB_PORT;
+const DB_NAME = process.env.DB_NAME;
+const DB_USER = process.env.DB_USER;
+const DB_PASSWORD = process.env.DB_PASSWORD;
+const dbConfig = DATABASE_URL
+  ? { connectionString: DATABASE_URL }
+  : (DB_HOST && DB_NAME && DB_USER && {
+      host: DB_HOST,
+      port: Number(DB_PORT) || 5432,
+      database: DB_NAME,
+      user: DB_USER,
+      password: DB_PASSWORD,
+    });
+let db = null;
+if (dbConfig) {
+  const { Pool } = pg;
+  db = new Pool({
+    ...dbConfig,
+    ssl: process.env.PGSSL === 'false' ? false : { rejectUnauthorized: false },
+    max: 10,
+  });
+  db.on('error', (e) => console.error('[db] idle client error:', e.message));
+}
+
+const SCHEMA_SQL = `
+CREATE TABLE IF NOT EXISTS users (
+  loginid TEXT PRIMARY KEY,
+  currency TEXT,
+  last_seen_at TIMESTAMPTZ DEFAULT now(),
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS activities (
+  id BIGSERIAL PRIMARY KEY,
+  loginid TEXT REFERENCES users(loginid) ON DELETE CASCADE,
+  type TEXT NOT NULL,
+  detail JSONB DEFAULT '{}',
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_activities_loginid ON activities(loginid, created_at DESC);
+CREATE TABLE IF NOT EXISTS circles (
+  id BIGSERIAL PRIMARY KEY,
+  name TEXT NOT NULL,
+  description TEXT DEFAULT '',
+  banner TEXT,
+  owner_loginid TEXT,
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS circle_members (
+  circle_id BIGINT REFERENCES circles(id) ON DELETE CASCADE,
+  loginid TEXT,
+  role TEXT DEFAULT 'member',
+  joined_at TIMESTAMPTZ DEFAULT now(),
+  PRIMARY KEY (circle_id, loginid)
+);
+CREATE TABLE IF NOT EXISTS bots (
+  id BIGSERIAL PRIMARY KEY,
+  name TEXT NOT NULL,
+  description TEXT DEFAULT '',
+  banner TEXT,
+  xml TEXT,
+  kind TEXT DEFAULT 'shared',
+  owner_loginid TEXT,
+  uses INTEGER DEFAULT 0,
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_bots_kind ON bots(kind, created_at DESC);
+CREATE TABLE IF NOT EXISTS copy_strategies (
+  id BIGSERIAL PRIMARY KEY,
+  name TEXT NOT NULL,
+  description TEXT DEFAULT '',
+  banner TEXT,
+  params JSONB DEFAULT '{}',
+  owner_loginid TEXT,
+  followers INTEGER DEFAULT 0,
+  status TEXT DEFAULT 'active',
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS copy_follows (
+  id BIGSERIAL PRIMARY KEY,
+  strategy_id BIGINT REFERENCES copy_strategies(id) ON DELETE CASCADE,
+  loginid TEXT,
+  stake_multiplier NUMERIC DEFAULT 1,
+  followed_at TIMESTAMPTZ DEFAULT now(),
+  UNIQUE (strategy_id, loginid)
+);
+`;
+
+async function initDb() {
+  if (!db) return;
+  try {
+    await db.query(SCHEMA_SQL);
+    // Migration for databases created before banner images were added.
+    await db.query('ALTER TABLE circles ADD COLUMN IF NOT EXISTS banner TEXT');
+    await db.query('ALTER TABLE bots ADD COLUMN IF NOT EXISTS banner TEXT');
+    await db.query('ALTER TABLE copy_strategies ADD COLUMN IF NOT EXISTS banner TEXT');
+    console.log('[db] connected — schema ready');
+  } catch (e) {
+    console.error('[db] init failed:', e.message);
+  }
+}
+initDb();
 
 // --- OAuth 2.0 + PKCE configuration (current Deriv flow) ---
 // client_id is the OAuth2 client id from developers.deriv.com (an app id is a
@@ -235,6 +343,7 @@ async function accountsFromToken(token) {
 }
 
 // --- Step 3: frontend asks for the (non-secret) account list for a session ---
+const loginNotified = new Set(); // session ids that already logged a 'login' activity
 app.get('/api/accounts', async (req, res) => {
   const { session } = req.query;
   const data = sessions.get(session);
@@ -245,6 +354,12 @@ app.get('/api/accounts', async (req, res) => {
   if (data.oauth === 'v2' && accounts.length === 0) {
     accounts = await accountsFromToken(data.token);
     if (accounts.length > 0) data.accounts = accounts;
+  }
+
+  // Log the first account resolution as a 'login' activity, once per session.
+  if (accounts.length > 0 && !loginNotified.has(session)) {
+    loginNotified.add(session);
+    logActivity(accounts[0].account, 'login', { accounts: accounts.length });
   }
 
   // Only expose account id + currency, never the token, to the browser
@@ -464,6 +579,357 @@ function authorizeInfo(token) {
     });
   });
 }
+
+// ---------------------------------------------------------------
+// Community + activity (PostgreSQL-backed)
+// ---------------------------------------------------------------
+
+// Resolve the Deriv loginid for an authenticated request. A session id
+// alone proves the browser owns the OAuth session; we additionally
+// require the requested account to belong to that session.
+function sessionLoginid(req) {
+  const session = req.body?.session || req.query.session;
+  const data = session ? sessions.get(session) : null;
+  if (!data) return null;
+  const account = req.body?.account || req.query.account;
+  if (account) {
+    const known = (data.accounts || []).find((a) => a.account === account);
+    if (known) return known.account;
+    // v2 single-token sessions before the account list is resolved
+    if (data.token && (!data.accounts || data.accounts.length === 0)) return account;
+    return null;
+  }
+  return null;
+}
+
+async function logActivity(loginid, type, detail = {}) {
+  if (!db || !loginid) return;
+  try {
+    await db.query(
+      'INSERT INTO users (loginid, last_seen_at) VALUES ($1, now()) ON CONFLICT (loginid) DO UPDATE SET last_seen_at = now()',
+      [loginid]
+    );
+    await db.query(
+      'INSERT INTO activities (loginid, type, detail) VALUES ($1, $2, $3)',
+      [loginid, type, JSON.stringify(detail)]
+    );
+  } catch (e) {
+    console.error('[db] activity log failed:', e.message);
+  }
+}
+
+// Log an arbitrary activity for the logged-in user (fire-and-forget).
+app.post('/api/activity', (req, res) => {
+  const loginid = sessionLoginid(req);
+  if (!loginid) return res.status(401).json({ error: 'Not authenticated' });
+  if (!db) return res.json({ ok: true, skipped: true });
+  const { type, detail } = req.body || {};
+  if (!type) return res.status(400).json({ error: 'Missing activity type' });
+  logActivity(loginid, type, detail || {});
+  res.json({ ok: true });
+});
+
+// Recent activity feed for the logged-in user.
+app.get('/api/activity', async (req, res) => {
+  const loginid = sessionLoginid(req);
+  if (!loginid) return res.status(401).json({ error: 'Not authenticated' });
+  if (!db) return res.json({ activities: [] });
+  try {
+    const { rows } = await db.query(
+      'SELECT type, detail, created_at FROM activities WHERE loginid = $1 ORDER BY created_at DESC LIMIT 30',
+      [loginid]
+    );
+    res.json({ activities: rows });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// --- Circles ---
+app.get('/api/circles', async (req, res) => {
+  if (!db) return res.status(503).json({ error: 'Database not configured' });
+  const loginid = sessionLoginid(req);
+  try {
+    const { rows } = await db.query(
+      `SELECT c.id, c.name, c.description, c.banner, c.owner_loginid,
+              COUNT(m.loginid)::int AS members,
+              COALESCE(BOOL_OR(m.loginid = $1), false) AS joined
+         FROM circles c
+         LEFT JOIN circle_members m ON m.circle_id = c.id
+        GROUP BY c.id
+        ORDER BY c.created_at DESC`,
+      [loginid]
+    );
+    res.json({ circles: rows });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/circles', async (req, res) => {
+  const loginid = sessionLoginid(req);
+  if (!loginid) return res.status(401).json({ error: 'Not authenticated' });
+  if (!db) return res.status(503).json({ error: 'Database not configured' });
+  const { name, description, banner } = req.body || {};
+  if (!name) return res.status(400).json({ error: 'Name is required' });
+  try {
+    const { rows } = await db.query(
+      'INSERT INTO circles (name, description, banner, owner_loginid) VALUES ($1, $2, $3, $4) RETURNING id, name, description, banner, owner_loginid',
+      [name, description || '', banner || null, loginid]
+    );
+    await db.query(
+      "INSERT INTO circle_members (circle_id, loginid, role) VALUES ($1, $2, 'owner') ON CONFLICT DO NOTHING",
+      [rows[0].id, loginid]
+    );
+    logActivity(loginid, 'circle_create', { circle_id: rows[0].id, name });
+    res.json({ circle: rows[0] });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/circles/:id/join', async (req, res) => {
+  const loginid = sessionLoginid(req);
+  if (!loginid) return res.status(401).json({ error: 'Not authenticated' });
+  if (!db) return res.status(503).json({ error: 'Database not configured' });
+  const id = Number(req.params.id);
+  const joined = req.body?.joined === true;
+  try {
+    if (joined) {
+      await db.query(
+        "INSERT INTO circle_members (circle_id, loginid, role) VALUES ($1, $2, 'member') ON CONFLICT DO NOTHING",
+        [id, loginid]
+      );
+      logActivity(loginid, 'circle_join', { circle_id: id });
+    } else {
+      await db.query(
+        "DELETE FROM circle_members WHERE circle_id = $1 AND loginid = $2 AND role <> 'owner'",
+        [id, loginid]
+      );
+      logActivity(loginid, 'circle_leave', { circle_id: id });
+    }
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/circles/:id/members', async (req, res) => {
+  if (!db) return res.status(503).json({ error: 'Database not configured' });
+  try {
+    const { rows } = await db.query(
+      `SELECT m.loginid, m.role, m.joined_at, u.last_seen_at
+         FROM circle_members m
+         LEFT JOIN users u ON u.loginid = m.loginid
+        WHERE m.circle_id = $1
+        ORDER BY (m.role = 'owner') DESC, m.joined_at ASC`,
+      [Number(req.params.id)]
+    );
+    res.json({ members: rows });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// --- Bots (free + shared) ---
+app.get('/api/bots', async (req, res) => {
+  if (!db) return res.status(503).json({ error: 'Database not configured' });
+  const loginid = sessionLoginid(req);
+  const kind = req.query.kind === 'free' ? 'free' : 'shared';
+  try {
+    const { rows } = await db.query(
+      `SELECT id, name, description, banner, kind, owner_loginid, uses, created_at,
+              (owner_loginid = $2) AS owned
+         FROM bots WHERE kind = $1
+        ORDER BY created_at DESC`,
+      [kind, loginid]
+    );
+    res.json({ bots: rows });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/bots', async (req, res) => {
+  const loginid = sessionLoginid(req);
+  if (!loginid) return res.status(401).json({ error: 'Not authenticated' });
+  if (!db) return res.status(503).json({ error: 'Database not configured' });
+  const { name, description, banner, xml, kind = 'shared' } = req.body || {};
+  if (!name || !xml) return res.status(400).json({ error: 'Name and strategy XML are required' });
+  const k = kind === 'free' ? 'free' : 'shared';
+  try {
+    const { rows } = await db.query(
+      'INSERT INTO bots (name, description, banner, xml, kind, owner_loginid) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, name, kind, owner_loginid',
+      [name, description || '', banner || null, xml, k, loginid]
+    );
+    logActivity(loginid, k === 'free' ? 'bot_upload_free' : 'bot_share', { bot_id: rows[0].id, name });
+    res.json({ bot: rows[0] });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/bots/:id/xml', async (req, res) => {
+  if (!db) return res.status(503).json({ error: 'Database not configured' });
+  try {
+    const { rows } = await db.query('SELECT xml FROM bots WHERE id = $1', [Number(req.params.id)]);
+    if (!rows.length) return res.status(404).json({ error: 'Bot not found' });
+    res.json({ xml: rows[0].xml });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/bots/:id/use', async (req, res) => {
+  if (!db) return res.status(503).json({ error: 'Database not configured' });
+  const loginid = sessionLoginid(req);
+  try {
+    await db.query('UPDATE bots SET uses = uses + 1 WHERE id = $1', [Number(req.params.id)]);
+    if (loginid) logActivity(loginid, 'bot_use', { bot_id: Number(req.params.id) });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete('/api/bots/:id', async (req, res) => {
+  const loginid = sessionLoginid(req);
+  if (!loginid) return res.status(401).json({ error: 'Not authenticated' });
+  if (!db) return res.status(503).json({ error: 'Database not configured' });
+  try {
+    await db.query('DELETE FROM bots WHERE id = $1 AND owner_loginid = $2', [Number(req.params.id), loginid]);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// --- Copy-trading strategies ---
+app.get('/api/copy/strategies', async (req, res) => {
+  if (!db) return res.status(503).json({ error: 'Database not configured' });
+  const loginid = sessionLoginid(req);
+  try {
+    const { rows } = await db.query(
+      `SELECT id, name, description, banner, params, owner_loginid, followers, status, created_at,
+              (owner_loginid = $1) AS owned
+         FROM copy_strategies
+        ORDER BY created_at DESC`,
+      [loginid]
+    );
+    res.json({ strategies: rows });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/copy/strategies', async (req, res) => {
+  const loginid = sessionLoginid(req);
+  if (!loginid) return res.status(401).json({ error: 'Not authenticated' });
+  if (!db) return res.status(503).json({ error: 'Database not configured' });
+  const { name, description, banner, params } = req.body || {};
+  if (!name) return res.status(400).json({ error: 'Name is required' });
+  try {
+    const { rows } = await db.query(
+      'INSERT INTO copy_strategies (name, description, banner, params, owner_loginid) VALUES ($1, $2, $3, $4, $5) RETURNING *',
+      [name, description || '', banner || null, JSON.stringify(params || {}), loginid]
+    );
+    logActivity(loginid, 'copy_strategy_create', { strategy_id: rows[0].id, name });
+    res.json({ strategy: rows[0] });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/copy/strategies/:id/follow', async (req, res) => {
+  const loginid = sessionLoginid(req);
+  if (!loginid) return res.status(401).json({ error: 'Not authenticated' });
+  if (!db) return res.status(503).json({ error: 'Database not configured' });
+  const id = Number(req.params.id);
+  const following = req.body?.following === true;
+  try {
+    if (following) {
+      const ins = await db.query(
+        'INSERT INTO copy_follows (strategy_id, loginid) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+        [id, loginid]
+      );
+      if (ins.rowCount === 1) {
+        await db.query('UPDATE copy_strategies SET followers = followers + 1 WHERE id = $1', [id]);
+      }
+      logActivity(loginid, 'copy_follow', { strategy_id: id });
+    } else {
+      await db.query('DELETE FROM copy_follows WHERE strategy_id = $1 AND loginid = $2', [id, loginid]);
+      await db.query('UPDATE copy_strategies SET followers = GREATEST(followers - 1, 0) WHERE id = $1', [id]);
+      logActivity(loginid, 'copy_unfollow', { strategy_id: id });
+    }
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/copy/follows', async (req, res) => {
+  const loginid = sessionLoginid(req);
+  if (!loginid) return res.status(401).json({ error: 'Not authenticated' });
+  if (!db) return res.json({ follows: [] });
+  try {
+    const { rows } = await db.query('SELECT strategy_id FROM copy_follows WHERE loginid = $1', [loginid]);
+    res.json({ follows: rows.map((r) => r.strategy_id) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete('/api/copy/strategies/:id', async (req, res) => {
+  const loginid = sessionLoginid(req);
+  if (!loginid) return res.status(401).json({ error: 'Not authenticated' });
+  if (!db) return res.status(503).json({ error: 'Database not configured' });
+  try {
+    await db.query('DELETE FROM copy_strategies WHERE id = $1 AND owner_loginid = $2', [Number(req.params.id), loginid]);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------------------------------------------------------------
+// AI Hub (Google Gemini)
+// Proxies requests to the Gemini API so the API key never leaves
+// the server. Add GEMINI_API_KEY to .env to enable.
+// ---------------------------------------------------------------
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.0-flash';
+
+app.get('/api/ai/status', (req, res) => {
+  res.json({ configured: !!GEMINI_API_KEY, model: GEMINI_MODEL });
+});
+
+app.post('/api/ai', async (req, res) => {
+  if (!GEMINI_API_KEY) return res.status(503).json({ error: 'AI is not configured — add GEMINI_API_KEY to the server env.' });
+  const { prompt, context, temperature = 0.7 } = req.body || {};
+  if (!prompt || !String(prompt).trim()) return res.status(400).json({ error: 'Missing prompt' });
+  try {
+    const systemInstruction = context || 'You are an expert trading assistant for a Deriv binary-options bot called PronoFX Dbot. Be concise, practical and honest about risk. You can reference synthetic indices, forex and crypto symbols. Never promise guaranteed profits.';
+    const body = {
+      system_instruction: { parts: [{ text: systemInstruction }] },
+      contents: [{ role: 'user', parts: [{ text: String(prompt).slice(0, 4000) }] }],
+      generationConfig: { temperature: Math.min(Math.max(temperature, 0), 1) },
+    };
+    const resp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      return res.status(resp.status).json({ error: `Gemini API error (${resp.status}): ${errText.slice(0, 200)}` });
+    }
+    const data = await resp.json();
+    const text = data.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('') || '';
+    res.json({ text });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 // ---------------------------------------------------------------
 // Public market data: symbol catalog + candle history

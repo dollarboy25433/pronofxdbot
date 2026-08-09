@@ -4,7 +4,17 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>PronoFX Dbot</title>
-    <script type="module" crossorigin src="/assets/index-BYTPle67.js"></script>
+    <script>
+      (function () {
+        try {
+          var t = localStorage.getItem('theme') || 'dark';
+          document.documentElement.setAttribute('data-theme', t);
+          var light = t === 'light' || (t === 'system' && window.matchMedia('(prefers-color-scheme: light)').matches);
+          document.body.style.background = light ? '#f4f5f7' : '#0b0e11';
+        } catch (e) {}
+      })();
+    </script>
+    <script type="module" crossorigin src="/assets/index-CAOAjD9r.js"></script>
   </head>
   <body>
     <div id="root"></div>

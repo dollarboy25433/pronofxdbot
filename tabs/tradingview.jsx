@@ -24,7 +24,7 @@ const MARKET_LABELS = {
   commodities: 'Commodities',
 };
 
-export default function TradingViewTab() {
+export default function TradingViewTab({ theme }) {
   const [symbols, setSymbols] = useState([]);
   const [symbolsError, setSymbolsError] = useState(null);
   const [symbol, setSymbol] = useState(null);
@@ -290,6 +290,7 @@ export default function TradingViewTab() {
               candles={candles}
               granularity={granularity}
               decimals={decimals}
+              theme={theme}
             />
           </div>
         </div>
@@ -339,13 +340,19 @@ export default function TradingViewTab() {
 // incremental live updates from the tick stream without rebuilding.
 // ---------------------------------------------------------------------
 
-function CandleChart({ candles, granularity, decimals }) {
+function CandleChart({ candles, granularity, decimals, theme }) {
   const containerRef = useRef(null);
   const chartRef = useRef(null);
   const seriesRef = useRef(null);
   const volumeRef = useRef(null);
   const appliedRef = useRef(null); // { firstT, count, gran } of last applied data
   const [legend, setLegend] = useState(null);
+
+  const systemLight = typeof window !== 'undefined' && window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches;
+  const isLight = theme === 'light' || (theme === 'system' && systemLight);
+  const colors = isLight
+    ? { bg: '#ffffff', text: '#5c6672', grid: '#eef0f3', border: '#dfe3e8', crosshair: 'rgba(22,24,29,0.25)', labelBg: '#eef0f3' }
+    : { bg: '#14181d', text: '#8b93a1', grid: '#1d2229', border: '#23282f', crosshair: 'rgba(242,243,245,0.3)', labelBg: '#23282f' };
 
   const toTime = (tMs) => {
     // lightweight-charts: business day for daily+, UTCTimestamp (seconds) intraday
@@ -364,27 +371,27 @@ function CandleChart({ candles, granularity, decimals }) {
     const chart = createChart(container, {
       autoSize: true,
       layout: {
-        background: { type: ColorType.Solid, color: '#14181d' },
-        textColor: '#8b93a1',
+        background: { type: ColorType.Solid, color: colors.bg },
+        textColor: colors.text,
         fontSize: 11,
         fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
         attributionLogo: false,
       },
       grid: {
-        vertLines: { color: '#1d2229' },
-        horzLines: { color: '#1d2229' },
+        vertLines: { color: colors.grid },
+        horzLines: { color: colors.grid },
       },
       timeScale: {
         timeVisible: granularity < 86400,
         secondsVisible: false,
-        borderColor: '#23282f',
+        borderColor: colors.border,
         rightOffset: 3,
       },
-      rightPriceScale: { borderColor: '#23282f' },
+      rightPriceScale: { borderColor: colors.border },
       crosshair: {
         mode: CrosshairMode.Normal,
-        vertLine: { color: 'rgba(242,243,245,0.3)', labelBackgroundColor: '#23282f' },
-        horzLine: { color: 'rgba(242,243,245,0.3)', labelBackgroundColor: '#23282f' },
+        vertLine: { color: colors.crosshair, labelBackgroundColor: colors.labelBg },
+        horzLine: { color: colors.crosshair, labelBackgroundColor: colors.labelBg },
       },
     });
 
@@ -423,7 +430,7 @@ function CandleChart({ candles, granularity, decimals }) {
       volumeRef.current = null;
       appliedRef.current = null;
     };
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [colors.bg, colors.text, colors.grid, colors.border, colors.crosshair, colors.labelBg]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Update scale/format options when granularity or decimals change.
   useEffect(() => {

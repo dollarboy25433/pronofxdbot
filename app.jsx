@@ -3,11 +3,12 @@ import {
   Play, LayoutGrid, Wrench, LineChart as ChartIcon, Users, Gift,
   Brain, Copy as CopyIcon, User, X, RotateCcw, TrendingUp, TrendingDown,
   GraduationCap, CandlestickChart, Calculator, BookOpen, Radio, Activity,
-  RefreshCw, AlertTriangle,
+  RefreshCw, AlertTriangle, Moon, Sun, Monitor,
 } from 'lucide-react';
 import { createChart, LineSeries, ColorType, CrosshairMode, LineStyle, createSeriesMarkers } from 'lightweight-charts';
 import ClassesTab from './tabs/classes.jsx';
 import TradingViewTab from './tabs/tradingview.jsx';
+import BotBuilderTab from './tabs/botbuilder.jsx';
 import RiskCalculatorTab from './tabs/risk.jsx';
 import TutorialsTab from './tabs/tutorials.jsx';
 
@@ -15,7 +16,7 @@ const API_BASE = import.meta.env.VITE_API_BASE || '';
 const WS_BASE = API_BASE.replace(/^http/, 'ws');
 const SESSION_KEY = 'deriv_session_id';
 
-const BRAND = 'PulseTrader';
+const BRAND = 'PronoFX Dbot';
 
 const TABS = [
   { id: 'campaigns', label: 'Campaigns', icon: Play },
@@ -60,24 +61,21 @@ const PROMOS = [
   },
 ];
 
-const FREE_BOTS = [
-  { id: 1, name: 'Even/Odd Ladder', desc: 'Digit-parity ladder strategy for synthetic indices.', img: 'https://picsum.photos/seed/ladderbot/300/300' },
-  { id: 2, name: 'Rebound Hunter', desc: 'Waits for a pullback threshold before entering.', img: 'https://picsum.photos/seed/reboundbot/300/300' },
-  { id: 3, name: 'Break & Retest', desc: 'Classic breakout-then-retest entry logic.', img: 'https://picsum.photos/seed/breakoutbot/300/300' },
-  { id: 4, name: 'Martingale Guard', desc: 'Capped martingale with a hard stop-loss.', img: 'https://picsum.photos/seed/martingale/300/300' },
-];
-
-const COPYTRADERS = [
-  { id: 1, name: 'a.kimani', roi: 18.4, followers: 312, img: 'https://picsum.photos/seed/trader1/100/100' },
-  { id: 2, name: 'v.novak', roi: 11.2, followers: 198, img: 'https://picsum.photos/seed/trader2/100/100' },
-  { id: 3, name: 's.osei', roi: -4.6, followers: 87, img: 'https://picsum.photos/seed/trader3/100/100' },
-  { id: 4, name: 'l.tanaka', roi: 26.9, followers: 540, img: 'https://picsum.photos/seed/trader4/100/100' },
-];
-
 export default function App() {
   const [activeTab, setActiveTab] = useState('campaigns');
-  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
   const [sidebarTab, setSidebarTab] = useState('summary');
+  const [authModal, setAuthModal] = useState(false);
+
+  // --- Theme ('dark' | 'light' | 'system') ---
+  const [theme, setTheme] = useState(() => {
+    try { return localStorage.getItem('theme') || 'dark'; } catch { return 'dark'; }
+  });
+
+  useEffect(() => {
+    document.documentElement.setAttribute('data-theme', theme);
+    try { localStorage.setItem('theme', theme); } catch { /* private mode */ }
+  }, [theme]);
 
   // --- OAuth / session state (same flow as before) ---
   const [sessionId, setSessionId] = useState(null);
@@ -90,6 +88,7 @@ export default function App() {
   const [botRunning, setBotRunning] = useState(false);
   const [openContracts, setOpenContracts] = useState([]);
   const [trades, setTrades] = useState([]);
+  const [pendingBotXml, setPendingBotXml] = useState(null);
   const intervalRef = useRef(null);
 
   useEffect(() => {
@@ -181,11 +180,41 @@ export default function App() {
     intervalRef.current = setInterval(fetchOpenContracts, 3000);
   }
 
+  // Open the run-bot panel. Logged-in users get the big modal; guests get the
+  // log in / sign up modal instead (they can't run the bot unauthenticated).
+  function openBotPanel() {
+    if (!sessionId) { setAuthModal(true); return; }
+    setSidebarOpen((v) => !v);
+  }
+
+  // The Run/Stop button inside the panel is also gated so a stale guest session
+  // can never start monitoring.
+  function handleRunBot() {
+    if (!sessionId) { setAuthModal(true); return; }
+    toggleBot();
+  }
+
   function resetStats() {
     clearInterval(intervalRef.current);
     setBotRunning(false);
     setOpenContracts([]);
     setTrades([]);
+  }
+
+  function handleUseBot(xml) {
+    setPendingBotXml(xml);
+    setActiveTab('builder');
+  }
+
+  async function logActivity(type, detail) {
+    if (!sessionId || !selectedAccount) return;
+    try {
+      await fetch(`${API_BASE}/api/activity`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session: sessionId, account: selectedAccount, type, detail: detail || {} }),
+      });
+    } catch { /* activity logging is best-effort */ }
   }
 
   useEffect(() => () => clearInterval(intervalRef.current), []);
@@ -210,8 +239,9 @@ export default function App() {
         loggedIn={!!sessionId}
         onLogin={handleLogin}
         onLogout={handleLogout}
-        sidebarOpen={sidebarOpen}
-        setSidebarOpen={setSidebarOpen}
+        onOpenBotPanel={openBotPanel}
+        theme={theme}
+        setTheme={setTheme}
       />
 
       {authError && <div className="auth-error">{authError}</div>}
@@ -222,6 +252,7 @@ export default function App() {
           {activeTab === 'dashboard' && (
             <DashboardTab
               loggedIn={!!sessionId}
+              sessionId={sessionId}
               accounts={accounts}
               selectedAccount={selectedAccount}
               setSelectedAccount={setSelectedAccount}
@@ -229,12 +260,51 @@ export default function App() {
               onLogin={handleLogin}
             />
           )}
-          {activeTab === 'builder' && <BotBuilderTab />}
-          {activeTab === 'charts' && <ChartsTab />}
-          {activeTab === 'circles' && <CirclesTab />}
-          {activeTab === 'freebots' && <FreeBotsTab />}
-          {activeTab === 'aihub' && <AIHubTab />}
-          {activeTab === 'copytrading' && <CopytradingTab />}
+          {activeTab === 'builder' && (
+            <BotBuilderTab
+              sessionId={sessionId}
+              accounts={accounts}
+              selectedAccount={selectedAccount}
+              setSelectedAccount={setSelectedAccount}
+              currency={currency}
+              balance={balance}
+              onBalanceUpdate={setBalance}
+              onTradeSettled={(trade) => setTrades((prev) => [...prev, trade])}
+              onRequireAuth={() => setAuthModal(true)}
+              initialXml={pendingBotXml}
+              onActivity={(type, detail) => logActivity(type, detail)}
+            />
+          )}
+          {activeTab === 'charts' && <ChartsTab theme={theme} />}
+          {activeTab === 'circles' && (
+            <CirclesTab
+              sessionId={sessionId}
+              selectedAccount={selectedAccount}
+              onRequireAuth={() => setAuthModal(true)}
+              onActivity={(type, detail) => logActivity(type, detail)}
+            />
+          )}
+          {activeTab === 'freebots' && (
+            <FreeBotsTab
+              sessionId={sessionId}
+              selectedAccount={selectedAccount}
+              onRequireAuth={() => setAuthModal(true)}
+              onUseBot={handleUseBot}
+              onActivity={(type, detail) => logActivity(type, detail)}
+            />
+          )}
+          {activeTab === 'aihub' && <AIHubTab onActivity={(type, detail) => logActivity(type, detail)} />}
+          {activeTab === 'copytrading' && (
+            <CopytradingTab
+              sessionId={sessionId}
+              selectedAccount={selectedAccount}
+              accounts={accounts}
+              currency={currency}
+              onRequireAuth={() => setAuthModal(true)}
+              onUseBot={handleUseBot}
+              onActivity={(type, detail) => logActivity(type, detail)}
+            />
+          )}
           {activeTab === 'manual' && (
             <ManualTraderTab
               sessionId={sessionId}
@@ -245,23 +315,21 @@ export default function App() {
               onBalanceUpdate={setBalance}
               currency={currency}
               onTradeSettled={(trade) => setTrades((prev) => [...prev, trade])}
+              theme={theme}
             />
           )}
           {activeTab === 'classes' && <ClassesTab />}
-          {activeTab === 'tradingview' && <TradingViewTab />}
+          {activeTab === 'tradingview' && <TradingViewTab theme={theme} />}
           {activeTab === 'riskcalc' && <RiskCalculatorTab />}
           {activeTab === 'tutorials' && <TutorialsTab />}
         </main>
 
         {sidebarOpen && (
-          <div className="sidebar-scrim" onClick={() => setSidebarOpen(false)} />
-        )}
-        {sidebarOpen && (
           <BotSidebar
             sidebarTab={sidebarTab}
             setSidebarTab={setSidebarTab}
             botRunning={botRunning}
-            toggleBot={toggleBot}
+            toggleBot={handleRunBot}
             resetStats={resetStats}
             stats={stats}
             profitLoss={profitLoss}
@@ -271,21 +339,207 @@ export default function App() {
             onClose={() => setSidebarOpen(false)}
           />
         )}
+        {authModal && (
+          <AuthModal
+            onClose={() => setAuthModal(false)}
+            onLogin={() => handleLogin('login')}
+            onRegister={() => handleLogin('register')}
+          />
+        )}
+
+        <button className="bot-fab" onClick={openBotPanel} title="Run bot">
+          <Play size={22} fill="currentColor" />
+        </button>
       </div>
+
+      <Footer />
     </div>
+  );
+}
+
+// ---------------- Footer ----------------
+
+const SOCIAL_LINKS = [
+  { name: 'Telegram', url: 'https://t.me/pronofxdbot', color: '#229ED9', path: 'M11.944 0A12 12 0 0 0 0 12a12 12 0 0 0 12 12 12 12 0 0 0 12-12A12 12 0 0 0 12 0a12 12 0 0 0-.056 0zm4.962 7.224c.1-.002.321.023.465.14a.506.506 0 0 1 .171.325c.016.093.036.306.02.472-.18 1.898-.962 6.502-1.36 8.627-.168.9-.499 1.201-.82 1.23-.696.065-1.225-.46-1.9-.902-1.056-.693-1.653-1.124-2.678-1.8-1.185-.78-.417-1.21.258-1.91.177-.184 3.247-2.977 3.307-3.23.007-.032.014-.15-.056-.212s-.174-.041-.249-.024c-.106.024-1.793 1.14-5.061 3.345-.48.33-.913.49-1.302.48-.428-.008-1.252-.241-1.865-.44-.752-.245-1.349-.374-1.297-.789.027-.216.325-.437.893-.663 3.498-1.524 5.83-2.529 6.998-3.014 3.332-1.386 4.025-1.627 4.476-1.635z' },
+  { name: 'WhatsApp', url: 'https://wa.me/254700000000', color: '#25D366', path: 'M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 0 1-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 0 1-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 0 1 2.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0 0 12.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 0 0 5.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 0 0-3.48-8.413Z' },
+  { name: 'Facebook', url: 'https://facebook.com/pronofxdbot', color: '#1877F2', path: 'M24 12.073c0-6.627-5.373-12-12-12s-12 5.373-12 12c0 5.99 4.388 10.954 10.125 11.854v-8.385H7.078v-3.47h3.047V9.43c0-3.007 1.792-4.669 4.533-4.669 1.312 0 2.686.235 2.686.235v2.953H15.83c-1.491 0-1.956.925-1.956 1.874v2.25h3.328l-.532 3.47h-2.796v8.385C19.612 23.027 24 18.062 24 12.073z' },
+  { name: 'YouTube', url: 'https://youtube.com/@pronofxdbot', color: '#FF0000', path: 'M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.377.505A3.017 3.017 0 0 0 .502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.376.505 9.376.505s7.505 0 9.377-.505a3.015 3.015 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814zM9.545 15.568V8.432L15.818 12l-6.273 3.568z' },
+  { name: 'TikTok', url: 'https://tiktok.com/@pronofxdbot', color: '#69C9D0', path: 'M12.525.02c1.31-.02 2.61-.01 3.91-.02.08 1.53.63 3.09 1.75 4.17 1.12 1.11 2.7 1.62 4.24 1.79v4.03c-1.44-.05-2.89-.35-4.2-.97-.57-.26-1.1-.59-1.62-.93-.01 2.92.01 5.84-.02 8.75-.08 1.4-.54 2.79-1.35 3.94-1.31 1.92-3.58 3.17-5.91 3.21-1.43.08-2.86-.31-4.08-1.03-2.02-1.19-3.44-3.37-3.65-5.71-.02-.5-.03-1-.01-1.49.18-1.9 1.12-3.72 2.58-4.96 1.66-1.44 3.98-2.13 6.15-1.72.02 1.48-.04 2.96-.04 4.44-.99-.32-2.15-.23-3.02.37-.63.41-1.11 1.04-1.36 1.75-.21.51-.15 1.07-.14 1.61.24 1.64 1.82 3.02 3.5 2.87 1.12-.01 2.19-.66 2.77-1.61.19-.33.4-.67.41-1.06.1-1.79.06-3.57.07-5.36.01-4.03-.01-8.05.02-12.07z' },
+];
+
+// Typing animation: reveals `text` one character at a time over `period` ms,
+// then holds for `hold` ms, resets and loops endlessly. A substring can be
+// emphasized as it types.
+function TypingText({ text, bold, period = 5000, hold = 2000 }) {
+  const [count, setCount] = useState(0);
+  const [phase, setPhase] = useState('typing'); // 'typing' | 'holding'
+
+  useEffect(() => {
+    if (phase !== 'typing') return;
+    const charMs = period / Math.max(text.length, 1);
+    const t = setInterval(() => {
+      setCount((c) => (c >= text.length ? c : c + 1));
+    }, charMs);
+    return () => clearInterval(t);
+  }, [phase, text, period]);
+
+  useEffect(() => {
+    if (phase === 'typing' && count >= text.length) setPhase('holding');
+  }, [count, phase, text.length]);
+
+  useEffect(() => {
+    if (phase !== 'holding') return;
+    const t = setTimeout(() => {
+      setCount(0);
+      setPhase('typing');
+    }, hold);
+    return () => clearTimeout(t);
+  }, [phase, hold]);
+
+  let rendered;
+  if (bold) {
+    const shown = text.slice(0, count);
+    const fullIdx = shown.indexOf(bold);
+    if (fullIdx !== -1) {
+      rendered = (
+        <>
+          {shown.slice(0, fullIdx)}
+          <strong>{shown.slice(fullIdx)}</strong>
+        </>
+      );
+    } else {
+      let partialLen = 0;
+      for (let i = 1; i <= bold.length; i++) {
+        if (shown.endsWith(bold.slice(0, i))) partialLen = i;
+      }
+      if (partialLen > 0) {
+        const start = shown.length - partialLen;
+        rendered = (
+          <>
+            {shown.slice(0, start)}
+            <strong>{shown.slice(start)}</strong>
+          </>
+        );
+      } else {
+        rendered = shown;
+      }
+    }
+  } else {
+    rendered = text.slice(0, count);
+  }
+
+  return (
+    <span className="typing-text" aria-label={text}>
+      {rendered}
+      <span className="typing-caret" aria-hidden="true" />
+    </span>
+  );
+}
+
+function Footer() {
+  const [modal, setModal] = useState(null); // 'about' | 'disclaimer'
+  return (
+    <>
+      <footer className="footer">
+        <div className="footer-inner">
+          <div className="footer-brand">
+            <div className="brand-mark footer-mark">P</div>
+            <div>
+              <div className="footer-brand-name">{BRAND}</div>
+              <div className="footer-tagline">Automated trading, community-driven.</div>
+            </div>
+          </div>
+
+          <div className="footer-links">
+            <span className="footer-links-label">Company</span>
+            <button className="footer-link" onClick={() => setModal('about')}>About</button>
+            <button className="footer-link" onClick={() => setModal('disclaimer')}>Disclaimer</button>
+          </div>
+
+          <div className="footer-socials">
+            <span className="footer-links-label">Follow us</span>
+            <div className="footer-socials-row">
+              {SOCIAL_LINKS.map((s) => (
+                <a
+                  key={s.name}
+                  className="footer-social"
+                  style={{ '--brand': s.color }}
+                  href={s.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  title={s.name}
+                  aria-label={s.name}
+                >
+                  <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true">
+                    <path d={s.path} />
+                  </svg>
+                </a>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        <div className="footer-bottom">
+          <TypingText text="Powered by McOKOTH TECHNOLOGIES" bold="McOKOTH TECHNOLOGIES" period={5000} hold={2000} />
+          <span className="footer-copy">© 2026 ALL RIGHTS RESERVED</span>
+        </div>
+      </footer>
+
+      {modal && (
+        <div className="footer-modal-overlay" onClick={() => setModal(null)}>
+          <div className="footer-modal" onClick={(e) => e.stopPropagation()}>
+            <button className="footer-modal-close" onClick={() => setModal(null)} aria-label="Close">
+              <X size={16} />
+            </button>
+            <h3 className="footer-modal-title">{modal === 'about' ? 'About PronoFX Dbot' : 'Disclaimer'}</h3>
+            {modal === 'about' ? (
+              <div className="footer-modal-body">
+                <p>PronoFX Dbot is an automated trading workspace for Deriv synthetic indices, forex and crypto. Build strategies with visual blocks, share them with the community, follow copy-traders and use AI-powered insights to inform your decisions.</p>
+                <p>Built and maintained by McOKOTH TECHNOLOGIES. Trading carries risk — never trade more than you can afford to lose.</p>
+              </div>
+            ) : (
+              <div className="footer-modal-body">
+                <p>Forex, CFD and binary-options trading involves substantial risk of loss and is not suitable for every investor. Past performance is not indicative of future results. PronoFX Dbot provides tools and education only; nothing on this platform is financial advice or a solicitation to trade.</p>
+                <p>Bot strategies, AI outputs and community content are informational. You are solely responsible for your own trading decisions and account.</p>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </>
   );
 }
 
 // ---------------- Top nav ----------------
 
-function TopNav({ activeTab, setActiveTab, loggedIn, onLogin, onLogout, sidebarOpen, setSidebarOpen }) {
+const THEME_OPTIONS = [
+  { id: 'dark', label: 'Dark', icon: Moon },
+  { id: 'light', label: 'Light', icon: Sun },
+  { id: 'system', label: 'System', icon: Monitor },
+];
+
+function TopNav({ activeTab, setActiveTab, loggedIn, onLogin, onLogout, onOpenBotPanel, theme, setTheme }) {
+  const [themeOpen, setThemeOpen] = useState(false);
+  const themeRef = useRef(null);
+
+  useEffect(() => {
+    const onDown = (e) => {
+      if (themeRef.current && !themeRef.current.contains(e.target)) setThemeOpen(false);
+    };
+    document.addEventListener('mousedown', onDown);
+    return () => document.removeEventListener('mousedown', onDown);
+  }, []);
+
+  const currentTheme = THEME_OPTIONS.find((o) => o.id === theme) || THEME_OPTIONS[0];
+  const ThemeIcon = currentTheme.icon;
+
   return (
     <header className="topnav">
       <div className="topnav-row">
         <div className="brand">
           <div className="brand-mark">P</div>
           <span className="brand-name">{BRAND}</span>
-          <span className="brand-badge">v2</span>
+          <span className="brand-badge">v1</span>
         </div>
 
         <div className="topnav-actions">
@@ -297,10 +551,37 @@ function TopNav({ activeTab, setActiveTab, loggedIn, onLogin, onLogout, sidebarO
           ) : (
             <button className="btn-ghost" onClick={onLogout}>Log out</button>
           )}
+          <div className="theme-wrap" ref={themeRef}>
+            <button
+              className="btn-icon"
+              title="Theme"
+              aria-label="Theme"
+              onClick={() => setThemeOpen((v) => !v)}
+            >
+              <ThemeIcon size={16} />
+            </button>
+            {themeOpen && (
+              <div className="theme-menu" role="menu">
+                {THEME_OPTIONS.map((o) => {
+                  const Icon = o.icon;
+                  return (
+                    <button
+                      key={o.id}
+                      role="menuitem"
+                      className={`theme-opt ${theme === o.id ? 'theme-opt-active' : ''}`}
+                      onClick={() => { setTheme(o.id); setThemeOpen(false); }}
+                    >
+                      <Icon size={15} /> {o.label}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </div>
           <button
             className="btn-icon"
-            title={sidebarOpen ? 'Hide bot panel' : 'Show bot panel'}
-            onClick={() => setSidebarOpen((v) => !v)}
+            title="Run bot"
+            onClick={onOpenBotPanel}
           >
             <Wrench size={16} />
           </button>
@@ -320,7 +601,7 @@ function TopNav({ activeTab, setActiveTab, loggedIn, onLogin, onLogout, sidebarO
               onClick={() => setActiveTab(t.id)}
             >
               <Icon size={15} />
-              {t.label}
+              <span className="tab-label">{t.label}</span>
             </button>
           );
         })}
@@ -332,36 +613,134 @@ function TopNav({ activeTab, setActiveTab, loggedIn, onLogin, onLogout, sidebarO
 // ---------------- Campaigns ----------------
 
 function CampaignsTab() {
+  const [view, setView] = useState('promotions');
+  const [sent, setSent] = useState(false);
+
+  const handleSubmit = (e) => {
+    e.preventDefault();
+    setSent(true);
+  };
+
   return (
     <div className="section">
       <div className="section-head">
         <div className="pill-row">
-          <span className="pill pill-active">Promotions</span>
-          <span className="pill">Book a Live Session</span>
+          <button
+            className={`pill ${view === 'promotions' ? 'pill-active' : ''}`}
+            onClick={() => { setView('promotions'); setSent(false); }}
+          >
+            Promotions
+          </button>
+          <button
+            className={`pill ${view === 'booking' ? 'pill-active' : ''}`}
+            onClick={() => { setView('booking'); setSent(false); }}
+          >
+            Book a Live Session
+          </button>
         </div>
       </div>
 
-      <div className="promo-row">
-        {PROMOS.map((p) => (
-          <div className="promo-card" key={p.id}>
-            <div className="promo-img" style={{ backgroundImage: `url(${p.img})` }}>
-              <span className="promo-tag" style={{ background: p.tagColor }}>{p.tag}</span>
+      {view === 'promotions' && (
+        <div className="promo-row">
+          {PROMOS.map((p) => (
+            <div className="promo-card" key={p.id}>
+              <div className="promo-img" style={{ backgroundImage: `url(${p.img})` }}>
+                <span className="promo-tag" style={{ background: p.tagColor }}>{p.tag}</span>
+              </div>
+              <div className="promo-body">
+                <h3>{p.title}</h3>
+                <p>{p.copy}</p>
+                <button className="btn-outline">View strategy</button>
+              </div>
             </div>
-            <div className="promo-body">
-              <h3>{p.title}</h3>
-              <p>{p.copy}</p>
-              <button className="btn-outline">View strategy</button>
+          ))}
+        </div>
+      )}
+
+      {view === 'booking' && (
+        <div className="booking-card">
+          <h3 className="booking-title">Book a Live Session</h3>
+          <p className="booking-sub">Reserve a one-on-one session with a strategy coach. We'll confirm your slot by email.</p>
+
+          {sent ? (
+            <div className="booking-done">
+              <div className="booking-done-mark">✓</div>
+              <p><strong>Request received!</strong></p>
+              <p>Your session request has been sent. Check your email for confirmation within 24 hours.</p>
+              <button className="btn-ghost" onClick={() => setSent(false)}>Book another session</button>
             </div>
-          </div>
-        ))}
-      </div>
+          ) : (
+            <form className="booking-form" onSubmit={handleSubmit}>
+              <label className="booking-field">
+                <span>Full name</span>
+                <input className="booking-input" type="text" placeholder="e.g. Jane Mwangi" required />
+              </label>
+              <label className="booking-field">
+                <span>Email address</span>
+                <input className="booking-input" type="email" placeholder="you@example.com" required />
+              </label>
+              <label className="booking-field">
+                <span>Deriv account (optional)</span>
+                <input className="booking-input" type="text" placeholder="e.g. CR12345678" />
+              </label>
+              <div className="booking-row">
+                <label className="booking-field">
+                  <span>Preferred date</span>
+                  <input className="booking-input" type="date" required />
+                </label>
+                <label className="booking-field">
+                  <span>Preferred time</span>
+                  <input className="booking-input" type="time" required />
+                </label>
+              </div>
+              <label className="booking-field">
+                <span>Session type</span>
+                <select className="select">
+                  <option>Strategy review</option>
+                  <option>Bot building help</option>
+                  <option>Risk management basics</option>
+                  <option>Getting started walkthrough</option>
+                </select>
+              </label>
+              <button className="btn-primary booking-submit" type="submit">Request session</button>
+            </form>
+          )}
+        </div>
+      )}
     </div>
   );
 }
 
 // ---------------- Dashboard ----------------
 
-function DashboardTab({ loggedIn, accounts, selectedAccount, setSelectedAccount, balance, onLogin }) {
+const ACTIVITY_LABELS = {
+  login: 'Logged in',
+  bot_run: 'Ran a bot',
+  bot_share: 'Shared a bot',
+  bot_upload_free: 'Uploaded a free bot',
+  bot_use: 'Used a community bot',
+  circle_create: 'Created a PCircle',
+  circle_join: 'Joined a PCircle',
+  circle_leave: 'Left a PCircle',
+  copy_strategy_create: 'Published a copy-trading strategy',
+  copy_follow: 'Started following a strategy',
+  copy_unfollow: 'Stopped following a strategy',
+};
+
+function DashboardTab({ loggedIn, sessionId, accounts, selectedAccount, setSelectedAccount, balance, onLogin }) {
+  const [activity, setActivity] = useState([]);
+
+  useEffect(() => {
+    if (!loggedIn || !selectedAccount) { setActivity([]); return; }
+    let cancelled = false;
+    fetch(`${API_BASE}/api/activity?session=${encodeURIComponent(sessionId)}&account=${encodeURIComponent(selectedAccount)}`)
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error('activity failed'))))
+      .then((data) => { if (!cancelled) setActivity(data.activities || []); })
+      .catch(() => { if (!cancelled) setActivity([]); });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loggedIn, selectedAccount]);
+
   return (
     <div className="section">
       <h2 className="section-title">Dashboard</h2>
@@ -372,49 +751,49 @@ function DashboardTab({ loggedIn, accounts, selectedAccount, setSelectedAccount,
           <button className="btn-primary" onClick={() => onLogin('login')}>Login with Deriv</button>
         </div>
       ) : (
-        <div className="dash-grid">
-          <div className="card">
-            <div className="card-label">Account</div>
-            <select
-              className="select"
-              value={selectedAccount || ''}
-              onChange={(e) => setSelectedAccount(e.target.value)}
-            >
-              {accounts.map((a) => (
-                <option key={a.account} value={a.account}>{a.account} ({a.currency})</option>
-              ))}
-            </select>
-          </div>
+        <>
+          <div className="dash-grid">
+            <div className="card">
+              <div className="card-label">Account</div>
+              <select
+                className="select"
+                value={selectedAccount || ''}
+                onChange={(e) => setSelectedAccount(e.target.value)}
+              >
+                {accounts.map((a) => (
+                  <option key={a.account} value={a.account}>{a.account} ({a.currency})</option>
+                ))}
+              </select>
+            </div>
 
-          <div className="card balance-card">
-            <div className="card-label">Balance</div>
-            <div className="balance-value">
-              {balance ? `${balance.balance} ${balance.currency}` : '—'}
+            <div className="card balance-card">
+              <div className="card-label">Balance</div>
+              <div className="balance-value">
+                {balance ? `${balance.balance} ${balance.currency}` : '—'}
+              </div>
             </div>
           </div>
-        </div>
-      )}
-    </div>
-  );
-}
 
-// ---------------- Bot Builder ----------------
-
-function BotBuilderTab() {
-  const blocks = ['Start', 'Purchase condition', 'Trade parameters', 'Restart / stop'];
-  return (
-    <div className="section">
-      <h2 className="section-title">Bot Builder</h2>
-      <p className="section-sub">Drag blocks to define your strategy logic. This is a starter canvas — wire it up to your own block library.</p>
-      <div className="builder-canvas">
-        {blocks.map((b, i) => (
-          <div className="builder-block" key={b}>
-            <span className="builder-index">{i + 1}</span>
-            {b}
+          <div className="card" style={{ marginTop: 14 }}>
+            <div className="card-label">Recent activity</div>
+            {activity.length === 0 ? (
+              <p style={{ color: 'var(--text-muted)', fontSize: 13, margin: '10px 0 0' }}>
+                No activity yet — run a bot, share one, join a PCircle or publish a copy strategy and it will show up here.
+              </p>
+            ) : (
+              <div className="activity-list">
+                {activity.map((a, i) => (
+                  <div className="activity-row" key={i}>
+                    <span className={`activity-dot activity-dot-${a.type}`} />
+                    <span className="activity-msg">{ACTIVITY_LABELS[a.type] || a.type}</span>
+                    <span className="activity-time">{new Date(a.created_at).toLocaleString()}</span>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
-        ))}
-        <button className="builder-add">+ Add block</button>
-      </div>
+        </>
+      )}
     </div>
   );
 }
@@ -428,7 +807,7 @@ const CHART_GRANS = [
   { value: 3600, label: '1h' },
 ];
 
-function ChartsTab() {
+function ChartsTab({ theme }) {
   const [symbols, setSymbols] = useState([]);
   const [symbol, setSymbol] = useState(null);
   const [granularity, setGranularity] = useState(60);
@@ -605,6 +984,7 @@ function ChartsTab() {
             points={points}
             decimals={decimals}
             lastPrice={last ?? undefined}
+            theme={theme}
           />
         </div>
       </div>
@@ -612,29 +992,195 @@ function ChartsTab() {
   );
 }
 
+// Banner image upload helper for community cards (circles, bots, strategies).
+function BannerPicker({ banner, onChange }) {
+  const ref = useRef(null);
+  function pick(e) {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    if (file.size > 800 * 1024) { e.target.value = ''; return; }
+    const reader = new FileReader();
+    reader.onload = () => onChange(String(reader.result || ''));
+    reader.readAsDataURL(file);
+    e.target.value = '';
+  }
+  return (
+    <div className="banner-picker">
+      {banner ? <img src={banner} alt="" className="banner-preview" /> : <div className="banner-preview banner-preview-empty">No banner</div>}
+      <div className="banner-actions">
+        <button type="button" className="btn-outline btn-small" onClick={() => ref.current && ref.current.click()}>
+          {banner ? 'Change banner' : '+ Upload banner'}
+        </button>
+        {banner && <button type="button" className="btn-outline btn-small" onClick={() => onChange('')}>Remove</button>}
+      </div>
+      <input ref={ref} type="file" accept="image/*" style={{ display: 'none' }} onChange={pick} />
+    </div>
+  );
+}
+
 // ---------------- Circles (copy-community) ----------------
 
-function CirclesTab() {
-  const circles = [
-    { name: 'Synthetic Index Circle', members: 214, img: 'https://picsum.photos/seed/circle1/200/200' },
-    { name: 'Forex Swing Circle', members: 132, img: 'https://picsum.photos/seed/circle2/200/200' },
-    { name: 'Scalpers Only', members: 89, img: 'https://picsum.photos/seed/circle3/200/200' },
-  ];
+function CirclesTab({ sessionId, selectedAccount, onRequireAuth, onActivity }) {
+  const [circles, setCircles] = useState([]);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+  const [showForm, setShowForm] = useState(false);
+  const [name, setName] = useState('');
+  const [description, setDescription] = useState('');
+  const [banner, setBanner] = useState('');
+  const [membersByCircle, setMembersByCircle] = useState({});
+  const [expanded, setExpanded] = useState(new Set());
+  const [membersBusy, setMembersBusy] = useState(false);
+
+  function toggleMembers(circle) {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(circle.id)) next.delete(circle.id);
+      else {
+        next.add(circle.id);
+        if (!membersByCircle[circle.id]) {
+          setMembersBusy(true);
+          fetch(`${API_BASE}/api/circles/${circle.id}/members`)
+            .then((r) => (r.ok ? r.json() : Promise.reject()))
+            .then((data) => setMembersByCircle((m) => ({ ...m, [circle.id]: data.members || [] })))
+            .catch(() => setMembersByCircle((m) => ({ ...m, [circle.id]: [] })))
+            .finally(() => setMembersBusy(false));
+        }
+      }
+      return next;
+    });
+  }
+
+  const load = (showBusy = false) => {
+    if (showBusy) setBusy(true);
+    const params = sessionId && selectedAccount
+      ? `?session=${encodeURIComponent(sessionId)}&account=${encodeURIComponent(selectedAccount)}`
+      : '';
+    fetch(`${API_BASE}/api/circles${params}`)
+      .then((r) => r.json())
+      .then((data) => {
+        if (data.circles) setCircles(data.circles);
+        else setError(data.error || 'Could not load circles.');
+      })
+      .catch((e) => setError(e.message))
+      .finally(() => setBusy(false));
+  };
+  useEffect(() => { load(true); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [sessionId, selectedAccount]);
+
+  function requireAuth() { onRequireAuth && onRequireAuth(); }
+
+  function handleJoin(circle, join) {
+    if (!sessionId || !selectedAccount) return requireAuth();
+    fetch(`${API_BASE}/api/circles/${circle.id}/join`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session: sessionId, account: selectedAccount, joined: join }),
+    })
+      .then((r) => r.json())
+      .then((data) => {
+        if (data.ok) {
+          setCircles((prev) => prev.map((c) => (c.id === circle.id
+            ? { ...c, joined: join, members: Math.max(0, c.members + (join ? 1 : -1)) }
+            : c)));
+          if (onActivity) onActivity(join ? 'circle_join' : 'circle_leave', { circle_id: circle.id });
+        } else setError(data.error);
+      })
+      .catch((e) => setError(e.message));
+  }
+
+  function handleCreate(e) {
+    e.preventDefault();
+    if (!sessionId || !selectedAccount) return requireAuth();
+    if (!name.trim()) return;
+    fetch(`${API_BASE}/api/circles`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session: sessionId, account: selectedAccount, name: name.trim(), description, banner }),
+    })
+      .then((r) => r.json())
+      .then((data) => {
+        if (data.circle) {
+          setCircles((prev) => [{ ...data.circle, members: 1, joined: true }, ...prev]);
+          setName(''); setDescription(''); setBanner(''); setShowForm(false);
+          if (onActivity) onActivity('circle_create', { circle_id: data.circle.id, name: data.circle.name });
+        } else setError(data.error);
+      })
+      .catch((e) => setError(e.message));
+  }
+
   return (
     <div className="section">
       <h2 className="section-title">PCircles</h2>
-      <p className="section-sub">Join a community circle to share and discuss strategies.</p>
-      <div className="circle-row">
-        {circles.map((c) => (
-          <div className="circle-card" key={c.name}>
-            <img src={c.img} alt="" className="circle-img" />
-            <div>
-              <div className="circle-name">{c.name}</div>
-              <div className="circle-members">{c.members} members</div>
-            </div>
-            <button className="btn-outline">Join</button>
+      <p className="section-sub">Join a community circle, share strategies and find copy-trading partners.</p>
+
+      <div className="community-actions">
+        <button className="btn-outline btn-small" onClick={() => setShowForm((v) => !v)}>
+          {showForm ? 'Cancel' : '+ Create a circle'}
+        </button>
+      </div>
+
+      {showForm && (
+        <form className="booking-card community-form" onSubmit={handleCreate}>
+          <div className="booking-field">
+            <span>Circle name</span>
+            <input className="booking-input" value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Volatility Scalpers" required />
           </div>
-        ))}
+          <div className="booking-field">
+            <span>Description (optional)</span>
+            <input className="booking-input" value={description} onChange={(e) => setDescription(e.target.value)} placeholder="What is this circle about?" />
+          </div>
+          <div className="booking-field">
+            <span>Banner image</span>
+            <BannerPicker banner={banner} onChange={setBanner} />
+          </div>
+          <button className="btn-primary booking-submit" type="submit">Create circle</button>
+        </form>
+      )}
+
+      {error && <div className="mt-error" style={{ marginBottom: 12 }}>{error}</div>}
+
+      <div className="circle-row">
+        {busy && circles.length === 0 && <p className="mt-hint">Loading circles…</p>}
+        {!busy && circles.length === 0 && !error && (
+          <p className="mt-hint">No circles yet — be the first to create one.</p>
+        )}
+        {circles.map((c) => {
+          const isOpen = expanded.has(c.id);
+          const members = membersByCircle[c.id];
+          return (
+            <div className="circle-card" key={c.id}>
+              <div className="circle-avatar">{c.name.slice(0, 1).toUpperCase()}</div>
+              <div className="circle-main">
+                <div className="circle-name">{c.name} {c.joined && <span className="circle-owned">member</span>}</div>
+                <div className="circle-members">{c.members} member{c.members === 1 ? '' : 's'}</div>
+                {c.description && <div className="circle-desc">{c.description}</div>}
+                {c.banner && <img src={c.banner} alt="" className="card-banner" />}
+                {isOpen && (
+                  <div className="circle-members-panel">
+                    <div className="circle-members-title">Members {membersBusy ? '…' : ''}</div>
+                    {members === undefined && <div className="mt-hint">Loading members…</div>}
+                    {members && members.length === 0 && <div className="mt-hint">No members yet.</div>}
+                    {members && members.map((m) => (
+                      <div className="circle-member" key={m.loginid}>
+                        <span className="member-avatar">{m.loginid.slice(0, 2).toUpperCase()}</span>
+                        <span className="member-login">{m.loginid}</span>
+                        <span className={m.role === 'owner' ? 'circle-owned' : 'member-role'}>{m.role}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+              <div className="circle-actions">
+                <button className="btn-outline btn-small" onClick={() => toggleMembers(c)}>
+                  {isOpen ? 'Hide members' : 'Members'}
+                </button>
+                <button className="btn-outline" onClick={() => handleJoin(c, !c.joined)}>
+                  {c.joined ? 'Leave' : 'Join'}
+                </button>
+              </div>
+            </div>
+          );
+        })}
       </div>
     </div>
   );
@@ -642,17 +1188,153 @@ function CirclesTab() {
 
 // ---------------- Free bots ----------------
 
-function FreeBotsTab() {
+function FreeBotsTab({ sessionId, selectedAccount, onRequireAuth, onUseBot, onActivity }) {
+  const [bots, setBots] = useState([]);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+  const [showForm, setShowForm] = useState(false);
+  const [name, setName] = useState('');
+  const [description, setDescription] = useState('');
+  const [banner, setBanner] = useState('');
+  const [xml, setXml] = useState('');
+  const [uploading, setUploading] = useState(false);
+  const fileRef = useRef(null);
+
+  const load = (showBusy = false) => {
+    if (showBusy) setBusy(true);
+    const params = sessionId && selectedAccount
+      ? `?session=${encodeURIComponent(sessionId)}&account=${encodeURIComponent(selectedAccount)}&kind=free`
+      : '?kind=free';
+    fetch(`${API_BASE}/api/bots${params}`)
+      .then((r) => r.json())
+      .then((data) => {
+        if (data.bots) setBots(data.bots);
+        else setError(data.error || 'Could not load free bots.');
+      })
+      .catch((e) => setError(e.message))
+      .finally(() => setBusy(false));
+  };
+  useEffect(() => { load(true); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [sessionId, selectedAccount]);
+
+  function requireAuth() { onRequireAuth && onRequireAuth(); }
+
+  function handleFile(e) {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => setXml(String(reader.result || ''));
+    reader.readAsText(file);
+    e.target.value = '';
+  }
+
+  function handleUpload(e) {
+    e.preventDefault();
+    if (!sessionId || !selectedAccount) return requireAuth();
+    if (!name.trim() || !xml.trim()) return;
+    setUploading(true);
+    setError(null);
+    fetch(`${API_BASE}/api/bots`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session: sessionId, account: selectedAccount, name: name.trim(), description, banner, xml, kind: 'free' }),
+    })
+      .then(async (r) => {
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.error || 'Upload failed');
+        setBots((prev) => [{ ...data.bot, uses: 0, description, banner, owned: true }, ...prev]);
+        setName(''); setDescription(''); setBanner(''); setXml(''); setShowForm(false);
+        if (onActivity) onActivity('bot_upload_free', { bot_id: data.bot.id, name: data.bot.name });
+      })
+      .catch((e) => setError(e.message))
+      .finally(() => setUploading(false));
+  }
+
+  function handleUse(bot) {
+    if (onUseBot) {
+      fetch(`${API_BASE}/api/bots/${bot.id}/xml`)
+        .then((r) => (r.ok ? r.json() : Promise.reject(new Error('Could not load bot'))))
+        .then((data) => {
+          if (sessionId && selectedAccount) {
+            fetch(`${API_BASE}/api/bots/${bot.id}/use`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ session: sessionId, account: selectedAccount }),
+            }).catch(() => { /* non-fatal */ });
+            if (onActivity) onActivity('bot_use', { bot_id: bot.id });
+          }
+          onUseBot(data.xml);
+        })
+        .catch((e) => setError(e.message));
+    }
+  }
+
+  function handleDelete(bot) {
+    if (!sessionId || !selectedAccount || !bot.owned) return;
+    fetch(`${API_BASE}/api/bots/${bot.id}`, {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session: sessionId, account: selectedAccount }),
+    })
+      .then((r) => r.json())
+      .then((data) => { if (data.ok) setBots((prev) => prev.filter((b) => b.id !== bot.id)); })
+      .catch((e) => setError(e.message));
+  }
+
   return (
     <div className="section">
       <h2 className="section-title">Free Bots</h2>
+      <p className="section-sub">Ready-made strategies uploaded by the community. Click "Run" to open one in the Bot Builder and run it live.</p>
+
+      <div className="community-actions">
+        <button className="btn-outline btn-small" onClick={() => setShowForm((v) => !v)}>
+          {showForm ? 'Cancel' : '+ Upload your bot'}
+        </button>
+      </div>
+
+      {showForm && (
+        <form className="booking-card community-form" onSubmit={handleUpload}>
+          <div className="booking-field">
+            <span>Bot name</span>
+            <input className="booking-input" value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Volatility Rebound" required />
+          </div>
+          <div className="booking-field">
+            <span>Description (optional)</span>
+            <input className="booking-input" value={description} onChange={(e) => setDescription(e.target.value)} placeholder="What does it do?" />
+          </div>
+          <div className="booking-field">
+            <span>Banner image</span>
+            <BannerPicker banner={banner} onChange={setBanner} />
+          </div>
+          <div className="booking-field">
+            <span>Strategy content (export it from the Bot Builder with "Export", or paste a Deriv DBot .xml file)</span>
+            <textarea className="booking-input bb-xml-input" rows={4} value={xml} onChange={(e) => setXml(e.target.value)} placeholder='{"app":"pronofxdbot","blocks":[…] }' />
+            <button type="button" className="btn-outline btn-small" style={{ alignSelf: 'flex-start' }} onClick={() => fileRef.current && fileRef.current.click()}>
+              Choose .xml file…
+            </button>
+            <input ref={fileRef} type="file" accept=".xml,.json" style={{ display: 'none' }} onChange={handleFile} />
+          </div>
+          {error && <div className="mt-error">{error}</div>}
+          <button className="btn-primary booking-submit" type="submit" disabled={uploading}>
+            {uploading ? 'Uploading…' : 'Upload bot'}
+          </button>
+        </form>
+      )}
+
       <div className="bot-grid">
-        {FREE_BOTS.map((b) => (
+        {busy && bots.length === 0 && <p className="mt-hint">Loading bots…</p>}
+        {!busy && bots.length === 0 && !error && (
+          <p className="mt-hint">No free bots yet — upload the first one from your Bot Builder!</p>
+        )}
+        {bots.map((b) => (
           <div className="bot-card" key={b.id}>
-            <img src={b.img} alt="" className="bot-img" />
-            <h3>{b.name}</h3>
-            <p>{b.desc}</p>
-            <button className="btn-outline">Use bot</button>
+            {b.banner ? <img src={b.banner} alt="" className="card-banner" /> : <div className="bot-avatar">{b.name.slice(0, 1).toUpperCase()}</div>}
+            <h3>{b.name} {b.owned && <span className="circle-owned">yours</span>}</h3>
+            <p>{b.description || 'A community-uploaded strategy.'}</p>
+            <div className="bot-meta">{b.uses} use{b.uses === 1 ? '' : 's'}</div>
+            <div className="bot-actions">
+              <button className="btn-primary btn-small" onClick={() => handleUse(b)}>Run</button>
+              {b.owned && <button className="btn-outline btn-small" onClick={() => handleDelete(b)}>Delete</button>}
+            </div>
           </div>
         ))}
       </div>
@@ -662,47 +1344,447 @@ function FreeBotsTab() {
 
 // ---------------- AI Hub ----------------
 
-function AIHubTab() {
+function AIHubTab({ onActivity }) {
+  const [status, setStatus] = useState({ configured: false, model: '' });
+  const [mode, setMode] = useState('chat'); // chat | sentiment | anomaly
+  const [chat, setChat] = useState([]);
+  const [input, setInput] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+
+  const [symbols, setSymbols] = useState([]);
+  const [symbol, setSymbol] = useState('R_75');
+  const [timeframe, setTimeframe] = useState('60');
+  const [count, setCount] = useState(120);
+  const [verdict, setVerdict] = useState(null);
+  const [verdictBusy, setVerdictBusy] = useState(false);
+
+  useEffect(() => {
+    fetch(`${API_BASE}/api/ai/status`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((s) => setStatus(s || { configured: false, model: '' }))
+      .catch(() => {});
+    fetch(`${API_BASE}/api/symbols`)
+      .then((r) => (r.ok ? r.json() : Promise.reject()))
+      .then((d) => setSymbols(d.symbols || []))
+      .catch(() => {});
+  }, []);
+
+  function callAI(prompt, context, temperature) {
+    return fetch(`${API_BASE}/api/ai`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt, context, temperature }),
+    })
+      .then(async (r) => {
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.error || 'AI request failed');
+        return d.text;
+      });
+  }
+
+  function sendChat(e) {
+    e.preventDefault();
+    const text = input.trim();
+    if (!text || busy) return;
+    setInput('');
+    setChat((c) => [...c, { role: 'user', text }]);
+    setBusy(true);
+    setError(null);
+    callAI(text)
+      .then((reply) => {
+        setChat((c) => [...c, { role: 'assistant', text: reply }]);
+        if (onActivity) onActivity('ai_chat', {});
+      })
+      .catch((e2) => setError(e2.message))
+      .finally(() => setBusy(false));
+  }
+
+  function analyze(kind) {
+    if (verdictBusy) return;
+    setVerdictBusy(true);
+    setError(null);
+    setVerdict(null);
+    fetch(`${API_BASE}/api/candles?symbol=${encodeURIComponent(symbol)}&granularity=${timeframe}&count=${count}`)
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error('Could not load candle data for this symbol.'))))
+      .then((cd) => {
+        const candles = cd.candles || [];
+        if (candles.length < 20) throw new Error('Not enough candle data for this symbol.');
+        const last = candles[candles.length - 1].c;
+        const lows = candles.map((c) => c.l);
+        const highs = candles.map((c) => c.h);
+        const low = Math.min(...lows);
+        const high = Math.max(...highs);
+        const range = (((high - low) / (low || 1)) * 100).toFixed(2);
+        const recent = candles.slice(-40).map((c) => `${new Date(c.t).toLocaleString()}  O${c.o} H${c.h} L${c.l} C${c.c}`).join('\n');
+        const prompt = kind === 'sentiment'
+          ? `Symbol ${symbol}, last ${candles.length} candles (granularity ${timeframe}s). Last close ~${last}, 40-candle range ${range}%.\nCandles:\n${recent}\n\nGive a short sentiment read: bullish / bearish / neutral with 2-3 reasons and a suggested bias for a short binary option contract.`
+          : `Symbol ${symbol}, last ${candles.length} candles (granularity ${timeframe}s). Last close ~${last}, 40-candle range ${range}%.\nCandles:\n${recent}\n\nFlag any anomalies: unusual volatility spikes, sudden gaps, or regime changes. List each one on its own line with a severity (low / med / high). If none stand out, say so clearly.`;
+        const context = kind === 'sentiment'
+          ? 'You are a market analyst for Deriv synthetic indices. Be objective, note uncertainty, never promise profits.'
+          : 'You are a volatility analyst for binary options trading on Deriv synthetic indices. Be precise and data-driven.';
+        return callAI(prompt, context, kind === 'sentiment' ? 0.5 : 0.4);
+      })
+      .then((text) => {
+        setVerdict({ kind, text });
+        if (onActivity) onActivity(kind === 'sentiment' ? 'ai_sentiment' : 'ai_anomaly', { symbol });
+      })
+      .catch((e2) => setError(e2.message))
+      .finally(() => setVerdictBusy(false));
+  }
+
+  const modeBtn = (id, label) => (
+    <button className={`btn-outline btn-small ${mode === id ? 'btn-active' : ''}`} onClick={() => setMode(id)}>{label}</button>
+  );
+
   return (
     <div className="section">
       <h2 className="section-title">AI Hub</h2>
-      <div className="aihub-grid">
-        <div className="aihub-card">
-          <img src="https://picsum.photos/seed/aihub1/500/300" alt="" className="aihub-img" />
-          <h3>Sentiment scoring</h3>
-          <p>Blends recent price action with a lightweight sentiment score to flag possible entries. Treat as one signal among several, not a guarantee.</p>
-        </div>
-        <div className="aihub-card">
-          <img src="https://picsum.photos/seed/aihub2/500/300" alt="" className="aihub-img" />
-          <h3>Anomaly alerts</h3>
-          <p>Flags unusual volatility spikes on your watched symbols so you can review before trading.</p>
-        </div>
+      <p className="section-sub">Gemini-powered assistant, sentiment scoring and anomaly alerts for your watched symbols.</p>
+
+      {!status.configured && (
+        <div className="mt-error">AI is not enabled yet — add <code>GEMINI_API_KEY</code> to your server environment (.env) and restart.</div>
+      )}
+
+      <div className="community-actions">
+        {modeBtn('chat', 'Assistant')}
+        {modeBtn('sentiment', 'Sentiment scoring')}
+        {modeBtn('anomaly', 'Anomaly alerts')}
       </div>
+
+      {mode === 'chat' && (
+        <div className="booking-card community-form">
+          <div className="aihub-chat">
+            {chat.length === 0 && <div className="mt-hint">Ask anything — strategy logic, market behaviour, risk sizing, or how to build a bot block.</div>}
+            {chat.map((m, i) => (
+              <div key={i} className={`aihub-msg aihub-${m.role}`}>
+                <div className="aihub-msg-label">{m.role === 'user' ? 'You' : status.model}</div>
+                <div className="aihub-msg-text">{m.text}</div>
+              </div>
+            ))}
+            {busy && <div className="mt-hint">Thinking…</div>}
+          </div>
+          <form className="booking-row" style={{ gap: 8 }} onSubmit={sendChat}>
+            <input className="booking-input" value={input} onChange={(e) => setInput(e.target.value)} placeholder="Ask the AI assistant…" disabled={busy} />
+            <button className="btn-primary booking-submit" type="submit" disabled={busy || !input.trim()}>Send</button>
+          </form>
+        </div>
+      )}
+
+      {(mode === 'sentiment' || mode === 'anomaly') && (
+        <div className="booking-card community-form">
+          <div className="booking-row">
+            <div className="booking-field">
+              <span>Symbol</span>
+              <select className="select" value={symbol} onChange={(e) => setSymbol(e.target.value)}>
+                {symbols.length === 0 && <option value="R_75">R_75</option>}
+                {symbols.map((s) => <option key={s.symbol} value={s.symbol}>{s.symbol}</option>)}
+              </select>
+            </div>
+            <div className="booking-field">
+              <span>Candle size</span>
+              <select className="select" value={timeframe} onChange={(e) => setTimeframe(e.target.value)}>
+                <option value="60">1 min</option>
+                <option value="300">5 min</option>
+                <option value="900">15 min</option>
+                <option value="3600">1 hour</option>
+              </select>
+            </div>
+            <div className="booking-field">
+              <span>Candles</span>
+              <input className="booking-input" type="number" min="20" max="500" value={count} onChange={(e) => setCount(Number(e.target.value))} />
+            </div>
+          </div>
+          <button className="btn-primary booking-submit" type="button" disabled={verdictBusy} onClick={() => analyze(mode)}>
+            {verdictBusy ? 'Analyzing…' : mode === 'sentiment' ? 'Score sentiment' : 'Scan for anomalies'}
+          </button>
+          {error && <div className="mt-error">{error}</div>}
+          {verdict && (
+            <div className="aihub-msg aihub-assistant">
+              <div className="aihub-msg-label">{status.model}</div>
+              <div className="aihub-msg-text">{verdict.text}</div>
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
 
 // ---------------- Copytrading ----------------
 
-function CopytradingTab() {
+const COPY_TYPE_LABELS = { RISE: 'Rise', FALL: 'Fall', CALL: 'Call', PUT: 'Put', ASIAU: 'Asia Up', ASIAD: 'Asia Down' };
+const COPY_UNIT_LABELS = { t: 'ticks', s: 'sec', m: 'min', h: 'hrs', d: 'days' };
+
+function CopytradingTab({ sessionId, selectedAccount, accounts, currency, onRequireAuth, onUseBot, onActivity }) {
+  const [strategies, setStrategies] = useState([]);
+  const [follows, setFollows] = useState(new Set());
+  const [symbols, setSymbols] = useState([]);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+  const [showForm, setShowForm] = useState(false);
+
+  const [name, setName] = useState('');
+  const [description, setDescription] = useState('');
+  const [banner, setBanner] = useState('');
+  const [symbol, setSymbol] = useState('R_75');
+  const [contractType, setContractType] = useState('RISE');
+  const [stake, setStake] = useState(1);
+  const [duration, setDuration] = useState(5);
+  const [durationUnit, setDurationUnit] = useState('t');
+  const [tradeAgain, setTradeAgain] = useState('both');
+  const [uploading, setUploading] = useState(false);
+
+  const loadStrategies = (showBusy = false) => {
+    if (showBusy) setBusy(true);
+    const params = sessionId && selectedAccount
+      ? `?session=${encodeURIComponent(sessionId)}&account=${encodeURIComponent(selectedAccount)}`
+      : '';
+    fetch(`${API_BASE}/api/copy/strategies${params}`)
+      .then((r) => r.json())
+      .then((data) => {
+        if (data.strategies) setStrategies(data.strategies);
+        else setError(data.error || 'Could not load strategies.');
+      })
+      .catch((e) => setError(e.message))
+      .finally(() => setBusy(false));
+  };
+  const loadFollows = () => {
+    if (!sessionId || !selectedAccount) { setFollows(new Set()); return; }
+    fetch(`${API_BASE}/api/copy/follows?session=${encodeURIComponent(sessionId)}&account=${encodeURIComponent(selectedAccount)}`)
+      .then((r) => (r.ok ? r.json() : { follows: [] }))
+      .then((data) => setFollows(new Set(data.follows || [])))
+      .catch(() => setFollows(new Set()));
+  };
+
+  useEffect(() => { loadStrategies(true); loadFollows(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [sessionId, selectedAccount]);
+  useEffect(() => {
+    fetch(`${API_BASE}/api/symbols`)
+      .then((r) => (r.ok ? r.json() : Promise.reject()))
+      .then((data) => setSymbols(data.symbols || []))
+      .catch(() => setSymbols([]));
+  }, []);
+
+  function requireAuth() { onRequireAuth && onRequireAuth(); }
+
+  function handleFollow(s, following) {
+    if (!sessionId || !selectedAccount) return requireAuth();
+    fetch(`${API_BASE}/api/copy/strategies/${s.id}/follow`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session: sessionId, account: selectedAccount, following }),
+    })
+      .then((r) => r.json())
+      .then((data) => {
+        if (data.ok) {
+          setFollows((prev) => {
+            const next = new Set(prev);
+            if (following) next.add(s.id); else next.delete(s.id);
+            return next;
+          });
+          setStrategies((prev) => prev.map((x) => (x.id === s.id
+            ? { ...x, followers: Math.max(0, x.followers + (following ? 1 : -1)) }
+            : x)));
+          if (onActivity) onActivity(following ? 'copy_follow' : 'copy_unfollow', { strategy_id: s.id });
+        } else setError(data.error);
+      })
+      .catch((e) => setError(e.message));
+  }
+
+  function handleCopy(s) {
+    const p = s.params || {};
+    if (!p.symbol) { setError('This strategy has no trade parameters yet.'); return; }
+    const blocks = [
+      { type: 'start', settings: {} },
+      {
+        type: 'buy',
+        settings: {
+          symbol: p.symbol,
+          market: p.market || 'synthetic_index',
+          contract_type: p.contract_type || 'RISE',
+          amount: Number(p.amount) || 1,
+          duration: Number(p.duration) || 5,
+          duration_unit: p.duration_unit || 't',
+        },
+      },
+      { type: 'trade_again', settings: { when: p.trade_again || 'both' } },
+    ];
+    if (onUseBot) onUseBot(JSON.stringify({ app: 'pronofxdbot', version: 1, blocks }));
+  }
+
+  function handlePublish(e) {
+    e.preventDefault();
+    if (!sessionId || !selectedAccount) return requireAuth();
+    if (!name.trim()) return;
+    setUploading(true);
+    setError(null);
+    const params = {
+      symbol,
+      contract_type: contractType,
+      amount: Number(stake),
+      basis: 'stake',
+      duration: Number(duration),
+      duration_unit: durationUnit,
+      trade_again: tradeAgain,
+      currency: currency || 'USD',
+    };
+    fetch(`${API_BASE}/api/copy/strategies`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session: sessionId, account: selectedAccount, name: name.trim(), description, banner, params }),
+    })
+      .then(async (r) => {
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.error || 'Publish failed');
+        setStrategies((prev) => [{ ...data.strategy, followers: 0, owned: true }, ...prev]);
+        setName(''); setDescription(''); setBanner(''); setShowForm(false);
+        if (onActivity) onActivity('copy_strategy_create', { strategy_id: data.strategy.id, name: data.strategy.name });
+      })
+      .catch((e) => setError(e.message))
+      .finally(() => setUploading(false));
+  }
+
+  function handleDelete(s) {
+    if (!sessionId || !selectedAccount) return requireAuth();
+    if (!window.confirm(`Delete strategy "${s.name}"?`)) return;
+    fetch(`${API_BASE}/api/copy/strategies/${s.id}`, {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session: sessionId, account: selectedAccount }),
+    })
+      .then((r) => r.json())
+      .then((data) => {
+        if (data.ok) {
+          setStrategies((prev) => prev.filter((x) => x.id !== s.id));
+          if (onActivity) onActivity('copy_strategy_delete', { strategy_id: s.id });
+        } else setError(data.error);
+      })
+      .catch((e) => setError(e.message));
+  }
+
+  function describeParams(p) {
+    if (!p || !p.symbol) return null;
+    const parts = [
+      `${p.symbol}`,
+      COPY_TYPE_LABELS[p.contract_type] || p.contract_type,
+      `${p.amount} ${p.currency || 'USD'}`,
+      `${p.duration} ${COPY_UNIT_LABELS[p.duration_unit] || p.duration_unit}`,
+    ];
+    return parts.join(' · ');
+  }
+
+  const symbolOpts = symbols.reduce((groups, s) => {
+    const key = s.market === 'synthetic_index' ? 'Synthetic Indices' : s.market === 'forex' ? 'Forex' : s.market === 'cryptocurrency' ? 'Crypto' : 'Other';
+    (groups[key] = groups[key] || []).push(s);
+    return groups;
+  }, {});
+
   return (
     <div className="section">
       <h2 className="section-title">Copytrading</h2>
+      <p className="section-sub">Publish a strategy for others to copy, or follow a strategy and run it on your own account with one click.</p>
+
+      <div className="community-actions">
+        <button className="btn-outline btn-small" onClick={() => setShowForm((v) => !v)}>
+          {showForm ? 'Cancel' : '+ Publish a strategy'}
+        </button>
+      </div>
+
+      {showForm && (
+        <form className="booking-card community-form" onSubmit={handlePublish}>
+          <div className="booking-field">
+            <span>Strategy name</span>
+            <input className="booking-input" value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Volatility 75 Rise Runner" required />
+          </div>
+          <div className="booking-field">
+            <span>Description (optional)</span>
+            <input className="booking-input" value={description} onChange={(e) => setDescription(e.target.value)} placeholder="Rules, timeframe, risk notes…" />
+          </div>
+          <div className="booking-field">
+            <span>Banner image</span>
+            <BannerPicker banner={banner} onChange={setBanner} />
+          </div>
+          <div className="booking-row">
+            <div className="booking-field">
+              <span>Symbol</span>
+              <select className="select" value={symbol} onChange={(e) => setSymbol(e.target.value)}>
+                {symbols.length === 0 && <option value="R_75">R_75</option>}
+                {Object.entries(symbolOpts).map(([market, list]) => (
+                  <optgroup key={market} label={market}>
+                    {list.map((s) => <option key={s.symbol} value={s.symbol}>{s.symbol}</option>)}
+                  </optgroup>
+                ))}
+              </select>
+            </div>
+            <div className="booking-field">
+              <span>Contract type</span>
+              <select className="select" value={contractType} onChange={(e) => setContractType(e.target.value)}>
+                {Object.entries(COPY_TYPE_LABELS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
+              </select>
+            </div>
+          </div>
+          <div className="booking-row">
+            <div className="booking-field">
+              <span>Stake ({currency || 'USD'})</span>
+              <input className="booking-input" type="number" min="0.01" step="0.01" value={stake} onChange={(e) => setStake(Number(e.target.value))} />
+            </div>
+            <div className="booking-field">
+              <span>Duration</span>
+              <div className="booking-row" style={{ gap: 8 }}>
+                <input className="booking-input" type="number" min="1" value={duration} onChange={(e) => setDuration(Number(e.target.value))} />
+                <select className="select" value={durationUnit} onChange={(e) => setDurationUnit(e.target.value)}>
+                  {Object.entries(COPY_UNIT_LABELS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
+                </select>
+              </div>
+            </div>
+          </div>
+          <div className="booking-field">
+            <span>Restart behaviour</span>
+            <select className="select" value={tradeAgain} onChange={(e) => setTradeAgain(e.target.value)}>
+              <option value="both">After every trade</option>
+              <option value="win">Only after a win</option>
+              <option value="loss">Only after a loss</option>
+            </select>
+          </div>
+          {error && <div className="mt-error">{error}</div>}
+          <button className="btn-primary booking-submit" type="submit" disabled={uploading}>
+            {uploading ? 'Publishing…' : 'Publish strategy'}
+          </button>
+        </form>
+      )}
+
       <div className="table-card">
         <div className="table-row table-head">
-          <span>Trader</span><span>30d ROI</span><span>Followers</span><span></span>
+          <span>Strategy</span><span>Followers</span><span>Status</span><span></span>
         </div>
-        {COPYTRADERS.map((t) => (
-          <div className="table-row" key={t.id}>
-            <span className="trader-cell">
-              <img src={t.img} alt="" className="trader-avatar" />
-              {t.name}
-            </span>
-            <span className={t.roi >= 0 ? 'roi-up' : 'roi-down'}>{t.roi >= 0 ? '+' : ''}{t.roi}%</span>
-            <span>{t.followers}</span>
-            <button className="btn-outline btn-small">Copy</button>
-          </div>
-        ))}
+        {busy && strategies.length === 0 && <div className="table-row"><span className="mt-hint">Loading strategies…</span></div>}
+        {!busy && strategies.length === 0 && !error && (
+          <div className="table-row"><span className="mt-hint">No strategies yet — publish the first one!</span></div>
+        )}
+        {strategies.map((s) => {
+          const following = follows.has(s.id);
+          const desc = describeParams(s.params);
+          return (
+            <div className="table-row" key={s.id}>
+              <span className="trader-cell">
+                {s.banner ? <img src={s.banner} alt="" className="table-banner" /> : <span className="trader-avatar">{s.name.slice(0, 1).toUpperCase()}</span>}
+                <span>
+                  {s.name} {s.owned && <span className="circle-owned">yours</span>}
+                  {desc && <div className="circle-desc">{desc}</div>}
+                </span>
+              </span>
+              <span>{s.followers}</span>
+              <span className={s.status === 'active' ? 'roi-up' : 'roi-down'}>{s.status}</span>
+              <span className="community-actions">
+                <button className={`btn-primary btn-small ${following ? 'btn-active' : ''}`} onClick={() => handleFollow(s, !following)}>
+                  {following ? 'Following' : 'Follow'}
+                </button>
+                <button className="btn-outline btn-small" onClick={() => handleCopy(s)}>Copy</button>
+                {s.owned && <button className="btn-outline btn-small" onClick={() => handleDelete(s)}>Delete</button>}
+              </span>
+            </div>
+          );
+        })}
       </div>
     </div>
   );
@@ -737,7 +1819,7 @@ function formatRemaining(ms) {
   return `${sec}s`;
 }
 
-function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAccount, balance, onBalanceUpdate, currency, onTradeSettled }) {
+function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAccount, balance, onBalanceUpdate, currency, onTradeSettled, theme }) {
   const [symbols, setSymbols] = useState([]);
   const [symbolsError, setSymbolsError] = useState(null);
   const [symbol, setSymbol] = useState(null);
@@ -1247,6 +2329,7 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
               entryPoint={entryPoint}
               lastPrice={lastPrice}
               direction={contractType}
+              theme={theme}
             />
           ) : (
             <div className="tv-empty mt-empty-chart">
@@ -1280,7 +2363,7 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
 // dotted price line and the entry point as a dashed price line + arrow.
 // ---------------------------------------------------------------------
 
-function LineFeedChart({ points, decimals, entryPoint, lastPrice, direction }) {
+function LineFeedChart({ points, decimals, entryPoint, lastPrice, direction, theme }) {
   const containerRef = useRef(null);
   const chartRef = useRef(null);
   const seriesRef = useRef(null);
@@ -1291,6 +2374,12 @@ function LineFeedChart({ points, decimals, entryPoint, lastPrice, direction }) {
 
   const toPoint = (p) => ({ time: p.t, value: p.price });
 
+  const systemLight = typeof window !== 'undefined' && window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches;
+  const isLight = theme === 'light' || (theme === 'system' && systemLight);
+  const colors = isLight
+    ? { bg: '#ffffff', text: '#5c6672', grid: '#eef0f3', border: '#dfe3e8', crosshair: 'rgba(22,24,29,0.25)', labelBg: '#eef0f3' }
+    : { bg: '#14181d', text: '#8b93a1', grid: '#1d2229', border: '#23282f', crosshair: 'rgba(242,243,245,0.3)', labelBg: '#23282f' };
+
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
@@ -1298,19 +2387,19 @@ function LineFeedChart({ points, decimals, entryPoint, lastPrice, direction }) {
     const chart = createChart(container, {
       autoSize: true,
       layout: {
-        background: { type: ColorType.Solid, color: '#14181d' },
-        textColor: '#8b93a1',
+        background: { type: ColorType.Solid, color: colors.bg },
+        textColor: colors.text,
         fontSize: 11,
         fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
         attributionLogo: false,
       },
-      grid: { vertLines: { color: '#1d2229' }, horzLines: { color: '#1d2229' } },
-      timeScale: { timeVisible: true, secondsVisible: true, borderColor: '#23282f', rightOffset: 3 },
-      rightPriceScale: { borderColor: '#23282f' },
+      grid: { vertLines: { color: colors.grid }, horzLines: { color: colors.grid } },
+      timeScale: { timeVisible: true, secondsVisible: true, borderColor: colors.border, rightOffset: 3 },
+      rightPriceScale: { borderColor: colors.border },
       crosshair: {
         mode: CrosshairMode.Normal,
-        vertLine: { color: 'rgba(242,243,245,0.3)', labelBackgroundColor: '#23282f' },
-        horzLine: { color: 'rgba(242,243,245,0.3)', labelBackgroundColor: '#23282f' },
+        vertLine: { color: colors.crosshair, labelBackgroundColor: colors.labelBg },
+        horzLine: { color: colors.crosshair, labelBackgroundColor: colors.labelBg },
       },
     });
 
@@ -1334,7 +2423,7 @@ function LineFeedChart({ points, decimals, entryPoint, lastPrice, direction }) {
       markersRef.current = null;
       appliedLen.current = 0;
     };
-  }, [decimals]);
+  }, [decimals, colors.bg, colors.text, colors.grid, colors.border, colors.crosshair, colors.labelBg]);
 
   // push live points incrementally (full reset when a new trade starts)
   useEffect(() => {
@@ -1407,97 +2496,122 @@ function LineFeedChart({ points, decimals, entryPoint, lastPrice, direction }) {
   return <div className="mt-chart-canvas" ref={containerRef} />;
 }
 
-// ---------------- Bot sidebar (Run panel) ----------------
+// ---------------- Bot runner (big modal) ----------------
 
 function BotSidebar({ sidebarTab, setSidebarTab, botRunning, toggleBot, resetStats, stats, profitLoss, currency, openContracts, trades, onClose }) {
   const recentTrades = [...trades].reverse().slice(0, 12);
   return (
-    <aside className="sidebar">
-      <div className="sidebar-topbar">
-        <button className="btn-icon" onClick={onClose}><X size={16} /></button>
-        <button className={`run-btn ${botRunning ? 'run-btn-active' : ''}`} onClick={toggleBot}>
-          <Play size={14} fill={botRunning ? 'currentColor' : 'none'} />
-          {botRunning ? 'Stop' : 'Run'}
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="bot-modal" role="dialog" aria-modal="true" onClick={(e) => e.stopPropagation()}>
+        <div className="sidebar-topbar">
+          <div className="modal-title">Bot Runner</div>
+          <div className="modal-tools">
+            <span className="run-status">{botRunning ? 'Monitoring open contracts' : 'Bot is idle'}</span>
+            <button className={`run-btn ${botRunning ? 'run-btn-active' : ''}`} onClick={toggleBot}>
+              <Play size={14} fill={botRunning ? 'currentColor' : 'none'} />
+              {botRunning ? 'Stop' : 'Run'}
+            </button>
+            <button className="btn-icon" onClick={onClose}><X size={16} /></button>
+          </div>
+        </div>
+
+        <div className="sidebar-tabs">
+          {['summary', 'transactions', 'journal'].map((t) => (
+            <button
+              key={t}
+              className={`sidebar-tab ${sidebarTab === t ? 'sidebar-tab-active' : ''}`}
+              onClick={() => setSidebarTab(t)}
+            >
+              {t[0].toUpperCase() + t.slice(1)}
+            </button>
+          ))}
+        </div>
+
+        <div className="sidebar-body">
+          {sidebarTab === 'summary' && (
+            <>
+              {stats.runs === 0 ? (
+                <div className="sidebar-empty">
+                  <p>Real contract results from the <strong>Manual Trader</strong> tab are tracked here.<br />Hit <strong>Run</strong> to watch your open contracts live.</p>
+                </div>
+              ) : (
+                <div className="sidebar-empty">
+                  <p>{stats.runs} real contract{stats.runs === 1 ? '' : 's'} settled this session.</p>
+                  <p style={{ marginTop: 8 }}>{openContracts.length} open right now.</p>
+                </div>
+              )}
+            </>
+          )}
+          {sidebarTab === 'transactions' && (
+            <div className="sidebar-ledger">
+              {recentTrades.length === 0 ? (
+                <div className="sidebar-empty"><p>No settled contracts yet. Buy one in Manual Trader.</p></div>
+              ) : (
+                recentTrades.map((t) => (
+                  <div className="ledger-row" key={`${t.id}-${t.ts}`}>
+                    <span className="ledger-dir">{t.direction || '—'}</span>
+                    <span className="ledger-sym">{t.symbol}</span>
+                    <span className={t.won ? 'roi-up' : 'roi-down'}>
+                      {t.profit >= 0 ? '+' : ''}{t.profit.toFixed(2)} {currency}
+                    </span>
+                  </div>
+                ))
+              )}
+            </div>
+          )}
+          {sidebarTab === 'journal' && (
+            <div className="sidebar-ledger">
+              {openContracts.length === 0 ? (
+                <div className="sidebar-empty">
+                  <p>{botRunning ? 'No open contracts on this account right now.' : 'Open contracts will appear here while running.'}</p>
+                </div>
+              ) : (
+                openContracts.map((c) => (
+                  <div className="ledger-row" key={c.contract_id}>
+                    <span className="ledger-dir">Open</span>
+                    <span className="ledger-sym" title={c.longcode}>{c.contract_id}</span>
+                    <span>{c.currency}</span>
+                  </div>
+                ))
+              )}
+            </div>
+          )}
+        </div>
+
+        <div className="stats-grid">
+          <Stat label="Total stake" value={`${stats.totalStake.toFixed(2)} ${currency}`} />
+          <Stat label="Total payout" value={`${stats.totalPayout.toFixed(2)} ${currency}`} />
+          <Stat label="No. of runs" value={stats.runs} />
+          <Stat label="Contracts lost" value={stats.lost} />
+          <Stat label="Contracts won" value={stats.won} />
+          <Stat label="Total profit/loss" value={`${profitLoss.toFixed(2)} ${currency}`} highlight={profitLoss >= 0 ? 'up' : 'down'} />
+        </div>
+
+        <button className="reset-btn" onClick={resetStats}>
+          <RotateCcw size={14} /> Reset
         </button>
-        <span className="run-status">{botRunning ? 'Monitoring open contracts' : 'Bot is idle'}</span>
       </div>
+    </div>
+  );
+}
 
-      <div className="sidebar-tabs">
-        {['summary', 'transactions', 'journal'].map((t) => (
-          <button
-            key={t}
-            className={`sidebar-tab ${sidebarTab === t ? 'sidebar-tab-active' : ''}`}
-            onClick={() => setSidebarTab(t)}
-          >
-            {t[0].toUpperCase() + t.slice(1)}
-          </button>
-        ))}
+// ---------------- Log in / Sign up modal (gated bot run) ----------------
+
+function AuthModal({ onClose, onLogin, onRegister }) {
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="auth-modal" role="dialog" aria-modal="true" onClick={(e) => e.stopPropagation()}>
+        <button className="btn-icon auth-close" onClick={onClose} aria-label="Close"><X size={16} /></button>
+        <div className="brand-mark auth-mark">P</div>
+        <h3>Connect your Deriv account</h3>
+        <p>You need to be logged in to run the bot. Link your Deriv account to start monitoring open contracts and trading live.</p>
+        <div className="auth-actions">
+          <button className="btn-primary" onClick={onLogin}>Log in</button>
+          <button className="btn-ghost" onClick={onRegister}>Sign up</button>
+        </div>
+        <span className="auth-note">Secure OAuth sign-in via Deriv. We never store your password.</span>
       </div>
-
-      <div className="sidebar-body">
-        {sidebarTab === 'summary' && (
-          <>
-            {stats.runs === 0 ? (
-              <div className="sidebar-empty">
-                <p>Real contract results from the <strong>Manual Trader</strong> tab are tracked here.<br />Hit <strong>Run</strong> to watch your open contracts live.</p>
-              </div>
-            ) : (
-              <div className="sidebar-empty">
-                <p>{stats.runs} real contract{stats.runs === 1 ? '' : 's'} settled this session.</p>
-                <p style={{ marginTop: 8 }}>{openContracts.length} open right now.</p>
-              </div>
-            )}
-          </>
-        )}
-        {sidebarTab === 'transactions' && (
-          <div className="sidebar-ledger">
-            {recentTrades.length === 0 ? (
-              <div className="sidebar-empty"><p>No settled contracts yet. Buy one in Manual Trader.</p></div>
-            ) : (
-              recentTrades.map((t) => (
-                <div className="ledger-row" key={`${t.id}-${t.ts}`}>
-                  <span className="ledger-dir">{t.direction || '—'}</span>
-                  <span className="ledger-sym">{t.symbol}</span>
-                  <span className={t.won ? 'roi-up' : 'roi-down'}>
-                    {t.profit >= 0 ? '+' : ''}{t.profit.toFixed(2)} {currency}
-                  </span>
-                </div>
-              ))
-            )}
-          </div>
-        )}
-        {sidebarTab === 'journal' && (
-          <div className="sidebar-ledger">
-            {openContracts.length === 0 ? (
-              <div className="sidebar-empty">
-                <p>{botRunning ? 'No open contracts on this account right now.' : 'Open contracts will appear here while running.'}</p>
-              </div>
-            ) : (
-              openContracts.map((c) => (
-                <div className="ledger-row" key={c.contract_id}>
-                  <span className="ledger-dir">Open</span>
-                  <span className="ledger-sym" title={c.longcode}>{c.contract_id}</span>
-                  <span>{c.currency}</span>
-                </div>
-              ))
-            )}
-          </div>
-        )}
-      </div>
-
-      <div className="stats-grid">
-        <Stat label="Total stake" value={`${stats.totalStake.toFixed(2)} ${currency}`} />
-        <Stat label="Total payout" value={`${stats.totalPayout.toFixed(2)} ${currency}`} />
-        <Stat label="No. of runs" value={stats.runs} />
-        <Stat label="Contracts lost" value={stats.lost} />
-        <Stat label="Contracts won" value={stats.won} />
-        <Stat label="Total profit/loss" value={`${profitLoss.toFixed(2)} ${currency}`} highlight={profitLoss >= 0 ? 'up' : 'down'} />
-      </div>
-
-      <button className="reset-btn" onClick={resetStats}>
-        <RotateCcw size={14} /> Reset
-      </button>
-    </aside>
+    </div>
   );
 }
 
@@ -1526,6 +2640,24 @@ function GlobalStyle() {
         --accent-teal: #00d0a0;
         --accent-indigo: #4c6ef5;
       }
+      :root[data-theme="light"] {
+        --bg: #f4f5f7;
+        --panel: #ffffff;
+        --panel-2: #eef0f3;
+        --border: #dfe3e8;
+        --text: #16181d;
+        --text-muted: #5c6672;
+      }
+      @media (prefers-color-scheme: light) {
+        :root[data-theme="system"] {
+          --bg: #f4f5f7;
+          --panel: #ffffff;
+          --panel-2: #eef0f3;
+          --border: #dfe3e8;
+          --text: #16181d;
+          --text-muted: #5c6672;
+        }
+      }
       * { box-sizing: border-box; }
       .app { background: var(--bg); color: var(--text); min-height: 100vh; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
 
@@ -1539,8 +2671,15 @@ function GlobalStyle() {
       .brand-badge { font-size: 10px; color: var(--text-muted); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; }
       .topnav-actions { display: flex; align-items: center; gap: 10px; }
 
+      .theme-wrap { position: relative; }
+      .theme-menu { position: absolute; top: calc(100% + 8px); right: 0; z-index: 40; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 4px; display: flex; flex-direction: column; gap: 2px; min-width: 140px; box-shadow: 0 12px 32px rgba(0,0,0,0.35); }
+      .theme-opt { display: flex; align-items: center; gap: 8px; background: transparent; border: none; color: var(--text-muted); padding: 8px 12px; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; text-align: left; }
+      .theme-opt:hover { background: var(--panel-2); color: var(--text); }
+      .theme-opt-active { color: var(--accent-red); background: rgba(255,68,79,0.1); }
+
       .tabs { display: flex; gap: 4px; padding: 0 14px 10px; overflow-x: auto; }
       .tab { display: flex; align-items: center; gap: 6px; background: transparent; border: none; color: var(--text-muted); padding: 8px 12px; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; white-space: nowrap; }
+      .tab-label { display: inline; }
       .tab:hover { background: var(--panel-2); color: var(--text); }
       .tab-active { background: rgba(255,68,79,0.12); color: var(--accent-red); }
 
@@ -1556,8 +2695,8 @@ function GlobalStyle() {
       .section-title { font-size: 20px; margin: 0 0 4px; }
       .section-sub { color: var(--text-muted); font-size: 13px; margin: 0 0 16px; }
 
-      .pill-row { display: flex; gap: 8px; margin-bottom: 18px; }
-      .pill { padding: 8px 16px; border-radius: 999px; background: var(--panel-2); color: var(--text-muted); font-size: 13px; font-weight: 600; cursor: pointer; }
+      .pill-row { display: flex; gap: 8px; margin-bottom: 18px; flex-wrap: wrap; }
+      .pill { padding: 8px 16px; border-radius: 999px; background: var(--panel-2); color: var(--text-muted); font-size: 13px; font-weight: 600; cursor: pointer; border: none; font-family: inherit; }
       .pill-active { background: rgba(255,68,79,0.12); color: var(--accent-red); }
 
       .promo-row { display: flex; gap: 16px; overflow-x: auto; padding-bottom: 8px; }
@@ -1567,6 +2706,21 @@ function GlobalStyle() {
       .promo-body { padding: 16px; }
       .promo-body h3 { margin: 0 0 6px; font-size: 15px; }
       .promo-body p { margin: 0 0 12px; font-size: 13px; color: var(--text-muted); line-height: 1.5; }
+
+      .booking-card { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 22px; max-width: 560px; }
+      .booking-title { margin: 0 0 4px; font-size: 18px; }
+      .booking-sub { margin: 0 0 18px; font-size: 13px; color: var(--text-muted); line-height: 1.6; }
+      .booking-form { display: flex; flex-direction: column; gap: 14px; }
+      .booking-row { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+      .booking-field { display: flex; flex-direction: column; gap: 6px; }
+      .booking-field > span { font-size: 12px; color: var(--text-muted); font-weight: 600; }
+      .booking-input { padding: 10px; border-radius: 8px; background: var(--panel-2); color: var(--text); border: 1px solid var(--border); font-size: 13px; font-family: inherit; }
+      .booking-input:focus { outline: none; border-color: var(--accent-red); }
+      .booking-submit { padding: 12px; }
+      .booking-done { display: flex; flex-direction: column; align-items: center; gap: 8px; text-align: center; padding: 10px 0; }
+      .booking-done-mark { width: 48px; height: 48px; border-radius: 50%; background: rgba(0,208,160,0.12); color: var(--accent-teal); display: flex; align-items: center; justify-content: center; font-size: 22px; font-weight: 800; }
+      .booking-done p { margin: 0; font-size: 13px; color: var(--text-muted); line-height: 1.6; }
+      .booking-done button { margin-top: 6px; }
 
       .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 18px; }
       .card-label { font-size: 12px; color: var(--text-muted); margin-bottom: 8px; font-weight: 600; }
@@ -1582,6 +2736,7 @@ function GlobalStyle() {
       .builder-add:hover { color: var(--accent-red); border-color: var(--accent-red); }
 
       .chart-head { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; }
+      .chart-head .tv-status { margin-left: auto; }
       .chart-delta { display: flex; align-items: center; gap: 4px; font-size: 13px; font-weight: 700; padding: 3px 8px; border-radius: 6px; }
       .chart-delta.up { color: var(--accent-teal); background: rgba(0,208,160,0.1); }
       .chart-delta.down { color: var(--accent-red); background: rgba(255,68,79,0.1); }
@@ -1592,7 +2747,22 @@ function GlobalStyle() {
       .circle-img { width: 40px; height: 40px; border-radius: 8px; object-fit: cover; }
       .circle-name { font-size: 14px; font-weight: 600; }
       .circle-members { font-size: 12px; color: var(--text-muted); }
-      .circle-card button { margin-left: auto; }
+      .circle-main { flex: 1; min-width: 0; }
+      .circle-actions { display: flex; flex-direction: column; gap: 6px; margin-left: auto; }
+      .circle-card .circle-actions button { margin-left: 0; }
+      .circle-members-panel { margin-top: 10px; border-top: 1px solid var(--border); padding-top: 8px; }
+      .circle-members-title { font-size: 11px; font-weight: 600; color: var(--text-muted); margin-bottom: 6px; }
+      .circle-member { display: flex; align-items: center; gap: 8px; padding: 4px 0; font-size: 12px; }
+      .member-avatar { width: 24px; height: 24px; border-radius: 6px; display: flex; align-items: center; justify-content: center; font-size: 10px; font-weight: 700; color: #fff; background: var(--accent-indigo); flex-shrink: 0; }
+      .member-login { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+      .member-role { font-size: 10px; color: var(--text-muted); }
+
+      .banner-picker { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+      .banner-preview { width: 120px; height: 64px; object-fit: cover; border-radius: 8px; border: 1px solid var(--border); }
+      .banner-preview-empty { display: flex; align-items: center; justify-content: center; font-size: 11px; color: var(--text-muted); background: var(--panel); }
+      .banner-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+      .card-banner { width: 100%; height: 110px; object-fit: cover; border-radius: 8px; margin-top: 8px; }
+      .table-banner { width: 44px; height: 44px; object-fit: cover; border-radius: 8px; flex-shrink: 0; }
 
       .bot-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 14px; max-width: 700px; }
       .bot-card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 14px; }
@@ -1606,12 +2776,40 @@ function GlobalStyle() {
       .aihub-card h3 { margin: 14px 14px 6px; font-size: 14px; }
       .aihub-card p { margin: 0 14px 14px; font-size: 12px; color: var(--text-muted); line-height: 1.5; }
 
+      .aihub-chat { display: flex; flex-direction: column; gap: 10px; max-height: 380px; overflow-y: auto; margin-bottom: 12px; }
+      .aihub-msg { padding: 10px 12px; border-radius: 10px; font-size: 13px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
+      .aihub-msg-label { font-size: 11px; font-weight: 600; opacity: 0.65; margin-bottom: 4px; }
+      .aihub-msg-text { font-size: 13px; }
+      .aihub-user { background: var(--accent-blue-dim, rgba(76, 110, 245, 0.14)); border: 1px solid var(--border); align-self: flex-end; max-width: 85%; }
+      .aihub-assistant { background: var(--panel); border: 1px solid var(--border); align-self: flex-start; max-width: 100%; }
+
       .table-card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; max-width: 560px; }
       .table-row { display: grid; grid-template-columns: 2fr 1fr 1fr 0.8fr; align-items: center; gap: 8px; padding: 12px 16px; font-size: 13px; border-bottom: 1px solid var(--border); }
       .table-row:last-child { border-bottom: none; }
       .table-head { color: var(--text-muted); font-size: 11px; text-transform: uppercase; font-weight: 700; }
       .trader-cell { display: flex; align-items: center; gap: 8px; }
       .trader-avatar { width: 26px; height: 26px; border-radius: 50%; object-fit: cover; }
+      .community-actions { margin-bottom: 14px; }
+      .community-form { max-width: 560px; margin-bottom: 18px; display: flex; flex-direction: column; gap: 12px; }
+      .community-form .booking-field > span { margin-bottom: 2px; }
+      .circle-avatar { width: 40px; height: 40px; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-weight: 800; font-size: 16px; color: #fff; background: var(--accent-indigo); flex-shrink: 0; }
+      .circle-owned { font-size: 10px; font-weight: 700; color: var(--accent-teal); background: rgba(0,208,160,0.12); border-radius: 999px; padding: 2px 7px; margin-left: 4px; vertical-align: middle; text-transform: uppercase; letter-spacing: 0.03em; }
+      .circle-desc { font-size: 11px; color: var(--text-muted); margin-top: 2px; line-height: 1.4; }
+      .bot-avatar { width: 100%; height: 90px; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-weight: 800; font-size: 30px; color: #fff; background: linear-gradient(135deg, var(--accent-indigo), var(--accent-red)); margin-bottom: 10px; }
+      .bot-meta { font-size: 11px; color: var(--text-muted); margin-bottom: 8px; }
+      .bot-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+      .btn-active { background: rgba(0,208,160,0.12); border-color: var(--accent-teal); color: var(--accent-teal); }
+      .bb-xml-input { font-family: 'SFMono-Regular', Consolas, monospace; font-size: 12px; resize: vertical; }
+      .activity-list { display: flex; flex-direction: column; margin-top: 6px; }
+      .activity-row { display: flex; align-items: center; gap: 10px; padding: 9px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
+      .activity-row:last-child { border-bottom: none; }
+      .activity-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; background: var(--accent-teal); }
+      .activity-dot-circle_create, .activity-dot-circle_join, .activity-dot-circle_leave { background: var(--accent-indigo); }
+      .activity-dot-bot_share, .activity-dot-bot_upload_free { background: var(--accent-red); }
+      .activity-dot-bot_use, .activity-dot-bot_run { background: var(--accent-teal); }
+      .activity-dot-copy_strategy_create, .activity-dot-copy_follow, .activity-dot-copy_unfollow { background: #e9c148; }
+      .activity-msg { flex: 1; color: var(--text); }
+      .activity-time { font-size: 11px; color: var(--text-muted); white-space: nowrap; }
       .roi-up { color: var(--accent-teal); font-weight: 700; }
       .roi-down { color: var(--accent-red); font-weight: 700; }
 
@@ -1676,9 +2874,12 @@ function GlobalStyle() {
       .ledger-dir { font-weight: 700; color: var(--text-muted); text-transform: uppercase; font-size: 10px; }
       .ledger-sym { color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-      .sidebar { width: 300px; flex-shrink: 0; background: var(--panel); border-left: 1px solid var(--border); min-height: calc(100vh - 97px); padding: 14px; display: flex; flex-direction: column; gap: 14px; }
-      .sidebar-scrim { display: none; }
-      .sidebar-topbar { display: flex; align-items: center; gap: 10px; }
+      .sidebar { display: contents; }
+      .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.6); backdrop-filter: blur(4px); z-index: 120; display: flex; align-items: center; justify-content: center; padding: 16px; }
+      .bot-modal { width: min(640px, 94vw); max-height: 92dvh; overflow-y: auto; overscroll-behavior: contain; background: var(--panel); border: 1px solid var(--border); border-radius: 18px; padding: 18px; display: flex; flex-direction: column; gap: 14px; box-shadow: 0 24px 80px rgba(0,0,0,0.55); }
+      .sidebar-topbar { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+      .modal-title { font-size: 16px; font-weight: 800; }
+      .modal-tools { display: flex; align-items: center; gap: 10px; }
       .run-btn { display: flex; align-items: center; gap: 6px; background: var(--accent-teal); color: #04211a; border: none; border-radius: 8px; padding: 8px 16px; font-weight: 700; font-size: 13px; cursor: pointer; }
       .run-btn-active { background: var(--accent-red); color: #fff; }
       .run-status { font-size: 12px; color: var(--text-muted); font-weight: 600; }
@@ -1697,8 +2898,50 @@ function GlobalStyle() {
       .reset-btn { display: flex; align-items: center; justify-content: center; gap: 6px; background: var(--panel-2); border: 1px solid var(--border); color: var(--text-muted); border-radius: 8px; padding: 10px; font-size: 13px; font-weight: 600; cursor: pointer; }
       .reset-btn:hover { color: var(--text); }
 
+      .bot-fab { position: fixed; right: 16px; bottom: 16px; z-index: 100; width: 54px; height: 54px; border-radius: 50%; background: var(--accent-red); color: #fff; border: none; display: none; align-items: center; justify-content: center; box-shadow: 0 8px 26px rgba(255,68,79,0.45); cursor: pointer; }
+      .bot-fab:hover { transform: translateY(-2px); }
+
+      .auth-modal { width: min(400px, 92vw); background: var(--panel); border: 1px solid var(--border); border-radius: 18px; padding: 28px 22px 22px; position: relative; display: flex; flex-direction: column; align-items: center; text-align: center; gap: 4px; box-shadow: 0 24px 80px rgba(0,0,0,0.55); }
+      .auth-close { position: absolute; top: 12px; right: 12px; }
+      .auth-mark { width: 44px; height: 44px; border-radius: 12px; font-size: 20px; }
+      .auth-modal h3 { margin: 14px 0 6px; font-size: 18px; }
+      .auth-modal p { margin: 0 0 18px; font-size: 13px; color: var(--text-muted); line-height: 1.6; }
+      .auth-actions { display: flex; gap: 10px; width: 100%; }
+      .auth-actions .btn-primary, .auth-actions .btn-ghost { flex: 1; padding: 12px; }
+      .auth-note { font-size: 11px; color: var(--text-muted); margin-top: 14px; line-height: 1.5; }
+
       .tabs { scrollbar-width: none; -webkit-overflow-scrolling: touch; }
       .tabs::-webkit-scrollbar { display: none; }
+
+      .footer { border-top: 1px solid var(--border); background: linear-gradient(180deg, var(--bg), var(--panel)); margin-top: 40px; }
+      .footer-inner { display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; gap: 24px; max-width: 1000px; margin: 0 auto; padding: 32px 24px 20px; }
+      .footer-brand { display: flex; align-items: center; gap: 12px; }
+      .footer-mark { width: 38px; height: 38px; border-radius: 10px; font-size: 18px; background: linear-gradient(135deg, var(--accent-red), var(--accent-indigo)); box-shadow: 0 4px 14px rgba(255, 68, 79, 0.25); }
+      .footer-brand-name { font-weight: 800; font-size: 16px; letter-spacing: -0.02em; }
+      .footer-tagline { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
+      .footer-links, .footer-socials { display: flex; flex-direction: column; gap: 8px; }
+      .footer-links-label { font-size: 10px; font-weight: 700; letter-spacing: 0.14em; text-transform: uppercase; color: var(--text-muted); }
+      .footer-link { background: none; border: none; color: var(--text-muted); font-size: 13px; padding: 2px 0; text-align: left; cursor: pointer; transition: color 0.15s ease; }
+      .footer-link:hover { color: var(--accent-red); }
+      .footer-socials-row { display: flex; gap: 10px; }
+      .footer-social { width: 38px; height: 38px; border-radius: 50%; display: flex; align-items: center; justify-content: center; color: var(--text-muted); border: 1px solid var(--border); background: var(--panel); transition: transform 0.15s ease, color 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease; }
+      .footer-social:hover { color: var(--brand); border-color: var(--brand); transform: translateY(-2px); box-shadow: 0 6px 18px color-mix(in srgb, var(--brand) 30%, transparent); }
+      .footer-bottom { display: flex; flex-direction: column; align-items: center; gap: 6px; border-top: 1px solid var(--border); max-width: 1000px; margin: 0 auto; padding: 16px 24px; font-size: 12px; color: var(--text-muted); text-align: center; }
+      .footer-copy { letter-spacing: 0.06em; }
+      .typing-text { font-variant-numeric: tabular-nums; }
+      .typing-text strong { color: var(--text); font-weight: 700; letter-spacing: 0.02em; }
+      .typing-caret { display: inline-block; width: 2px; height: 1em; margin-left: 2px; vertical-align: text-bottom; background: var(--accent-red); animation: caret-blink 0.9s steps(1) infinite; }
+      @keyframes caret-blink { 0%, 49% { opacity: 1; } 50%, 100% { opacity: 0; } }
+      .footer-co { color: var(--text); font-weight: 700; letter-spacing: 0.02em; }
+      .footer-copy { letter-spacing: 0.06em; }
+      .footer-modal-overlay { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.55); display: flex; align-items: center; justify-content: center; z-index: 100; padding: 20px; }
+      .footer-modal { position: relative; background: var(--panel); border: 1px solid var(--border); border-radius: 14px; max-width: 460px; width: 100%; padding: 24px; }
+      .footer-modal-close { position: absolute; top: 12px; right: 12px; background: none; border: none; color: var(--text-muted); cursor: pointer; padding: 4px; border-radius: 6px; }
+      .footer-modal-close:hover { color: var(--text); background: var(--panel-2); }
+      .footer-modal-title { margin: 0 0 12px; font-size: 18px; }
+      .footer-modal-body { font-size: 13px; color: var(--text-muted); line-height: 1.6; }
+      .footer-modal-body p { margin: 0 0 12px; }
+      .footer-modal-body p:last-child { margin-bottom: 0; }
 
       @media (max-width: 1024px) {
         .main { padding: 20px; }
@@ -1706,18 +2949,19 @@ function GlobalStyle() {
 
       @media (max-width: 900px) {
         .body { flex-direction: column; }
-        .sidebar {
-          position: fixed; top: 0; right: 0; bottom: 0;
-          width: min(320px, 88vw); min-height: 0; height: 100dvh;
-          border-left: 1px solid var(--border); border-top: none;
-          box-shadow: -12px 0 40px rgba(0,0,0,0.5); z-index: 110;
-          overflow-y: auto; overscroll-behavior: contain;
-        }
-        .sidebar-scrim { display: block; position: fixed; inset: 0; background: rgba(0,0,0,0.55); z-index: 105; }
         .manual-grid, .dash-grid { grid-template-columns: 1fr; }
         .mt-grid { grid-template-columns: 1fr; }
         .table-card { overflow-x: auto; }
         .table-row { grid-template-columns: minmax(160px, 2fr) 1fr 1fr 0.8fr; min-width: 480px; }
+      }
+
+      @media (max-width: 760px) {
+        .tab { padding: 8px; gap: 0; }
+        .tab-label { display: none; }
+        .tabs { gap: 2px; }
+        .chart-head { flex-wrap: wrap; }
+        .chart-head .tv-status { margin-left: auto; }
+        .bot-fab { display: flex; }
       }
 
       @media (max-width: 640px) {
@@ -1731,10 +2975,18 @@ function GlobalStyle() {
         .tab { padding: 7px 10px; font-size: 12px; }
         .promo-card { flex-basis: 260px; }
         .promo-img { height: 130px; }
+        .promo-row { display: grid; grid-template-columns: 1fr; overflow: visible; gap: 14px; }
+        .promo-card { flex-basis: auto; width: 100%; }
         .builder-canvas { max-width: 100%; }
         .bot-grid { grid-template-columns: 1fr; }
         .aihub-grid { grid-template-columns: 1fr; }
         .stats-grid { grid-template-columns: 1fr 1fr; }
+        .bot-modal { padding: 14px; }
+        .run-status { display: none; }
+        .modal-tools { gap: 8px; }
+        .bot-fab { width: 48px; height: 48px; right: 14px; bottom: 14px; }
+        .footer-inner { flex-direction: column; gap: 18px; }
+        .footer-bottom { flex-direction: column; align-items: center; text-align: center; }
       }
 
       @media (max-width: 420px) {
@@ -1743,6 +2995,8 @@ function GlobalStyle() {
         .log-row { grid-template-columns: 1fr; gap: 4px; }
         .mt-strip { grid-template-columns: 1fr; }
         .mt-chart-canvas { height: 260px; }
+        .booking-row { grid-template-columns: 1fr; }
+        .booking-card { padding: 16px; }
       }
     `}</style>
   );
