@@ -11,7 +11,7 @@ import TradingViewTab from './tabs/tradingview.jsx';
 import RiskCalculatorTab from './tabs/risk.jsx';
 import TutorialsTab from './tabs/tutorials.jsx';
 
-const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:4000';
+const API_BASE = import.meta.env.VITE_API_BASE || '';
 const WS_BASE = API_BASE.replace(/^http/, 'ws');
 const SESSION_KEY = 'deriv_session_id';
 

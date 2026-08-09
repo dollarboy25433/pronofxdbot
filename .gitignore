@@ -1,2 +1,5 @@
 node_modules
 .env
+
+# Stakpak session files
+.stakpak/session*

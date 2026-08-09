@@ -4,7 +4,7 @@ import {
 } from 'lucide-react';
 import { createChart, CandlestickSeries, HistogramSeries, ColorType, CrosshairMode, LineStyle } from 'lightweight-charts';
 
-const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:4000';
+const API_BASE = import.meta.env.VITE_API_BASE || '';
 const WS_BASE = API_BASE.replace(/^http/, 'ws');
 
 const GRANULARITIES = [
