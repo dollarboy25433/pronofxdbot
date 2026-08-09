@@ -508,6 +508,72 @@ app.get('/api/contract/open', async (req, res) => {
   }
 });
 
+// ---------------------------------------------------------------
+// Cashier (Deposit / Withdraw via Deriv's own cashier pages)
+// ---------------------------------------------------------------
+// The `cashier` API returns the URL of Deriv's hosted deposit/withdrawal
+// page for the logged-in account, which we embed via an iframe. Fiat
+// accounts use the `doughflow` provider (a hosted cashier page). Crypto
+// withdrawals additionally require an email verification code
+// (ASK_EMAIL_VERIFY -> verify_email -> retry with the code).
+const CRYPTO_CURRENCIES = new Set([
+  'BTC', 'ETH', 'LTC', 'USDT', 'USDC', 'DAI', 'UST', 'TUSD',
+  'eUSDT', 'tUSDT', 'TUSDT', 'USDT_TRC20', 'USDT_ERC20', 'BTCW', 'ETW', 'LTCW',
+]);
+
+function cashierProvider(currency) {
+  return CRYPTO_CURRENCIES.has(String(currency || '').toUpperCase()) ? 'crypto' : 'doughflow';
+}
+
+// Open Deriv's cashier page (deposit or withdraw) for the account.
+app.post('/api/cashier', async (req, res) => {
+  const ctx = findSession(req, res);
+  if (!ctx) return;
+
+  const { action, verification_code } = req.body || {};
+  const cashierAction = action === 'withdraw' ? 'withdraw' : 'deposit';
+  const provider = cashierProvider(ctx.acct.currency);
+
+  const payload = { cashier: cashierAction, provider };
+  if (provider === 'crypto') payload.type = 'url';
+  if (cashierAction === 'withdraw' && provider === 'doughflow' && verification_code) {
+    payload.verification_code = verification_code;
+  }
+
+  try {
+    const result = await derivRequest(ctx.acct.token, payload);
+    const info = result.cashier;
+    const url = typeof info === 'string' ? info : (info && (info.url || info.cashier_url)) || null;
+    if (!url) {
+      return res.status(502).json({ error: 'Deriv did not return a cashier page for this account.' });
+    }
+    logActivity(ctx.acct.account, cashierAction === 'deposit' ? 'deposit' : 'withdraw', {});
+    res.json({ url, provider });
+  } catch (err) {
+    if (err.code === 'ASK_EMAIL_VERIFY') {
+      return res.json({ needVerification: true, error: err.message });
+    }
+    res.status(502).json({ error: err.message, code: err.code });
+  }
+});
+
+// Send the email verification code required for withdrawals.
+app.post('/api/cashier/verify-email', async (req, res) => {
+  const ctx = findSession(req, res);
+  if (!ctx) return;
+
+  const { type = 'withdraw' } = req.body || {};
+  try {
+    const settings = await derivRequest(ctx.acct.token, { get_settings: 1 });
+    const email = settings.get_settings && settings.get_settings.email;
+    if (!email) return res.status(502).json({ error: 'Could not read the account email from Deriv.' });
+    await derivRequest(ctx.acct.token, { verify_email: email, type });
+    res.json({ ok: true, email });
+  } catch (err) {
+    res.status(502).json({ error: err.message, code: err.code });
+  }
+});
+
 // --- Helper: open a short-lived WS connection, send one request ---
 // Pass a token to authorize first (account data). Pass `null` for public
 // endpoints (ticks_history, active_symbols) that do not require a token.
@@ -531,7 +597,10 @@ function derivRequest(token, request) {
       if (response.error) {
         clearTimeout(timeout);
         ws.close();
-        return reject(new Error(response.error.message));
+        const err = new Error(response.error.message);
+        err.code = response.error.code;
+        err.details = response.error.details;
+        return reject(err);
       }
 
       if (response.msg_type === 'authorize') {
@@ -1161,6 +1230,8 @@ function getTickStream(symbol) {
     emptyTicks: 0,         // consecutive placeholder ticks seen while streaming
     pollTimer: null,
     pollInFlight: false,
+    granularity: 60,       // candle bucket width in seconds (clients may change it)
+    candle: null,          // forming candle for stream-mode ohlc aggregation
   };
   tickStreams.set(symbol, stream);
 
@@ -1171,10 +1242,29 @@ function getTickStream(symbol) {
     }
   };
 
+  // Aggregate real streaming ticks into an ohlc candle at the stream's
+  // granularity so candle charts get the same open/high/low/close updates
+  // a `ticks_history` + `subscribe` stream would push.
+  const updateStreamCandle = (quote, epoch) => {
+    const gran = stream.granularity;
+    const bucket = Math.floor(epoch / gran) * gran;
+    const cur = stream.candle;
+    if (!cur || cur.epoch !== bucket) {
+      stream.candle = { epoch: bucket, open: quote, high: quote, low: quote, close: quote };
+      broadcast({ msg_type: 'ohlc', ohlc: { symbol, epoch: bucket, open: quote, high: quote, low: quote, close: quote, granularity: gran } });
+    } else {
+      cur.high = Math.max(cur.high, quote);
+      cur.low = Math.min(cur.low, quote);
+      cur.close = quote;
+      broadcast({ msg_type: 'ohlc', ohlc: { symbol, epoch: bucket, open: cur.open, high: cur.high, low: cur.low, close: quote, granularity: gran } });
+    }
+  };
+
   const handleTick = (quote, epoch) => {
     if (epoch != null && epoch <= stream.lastEpoch) return;
     if (epoch != null) stream.lastEpoch = epoch;
     broadcast({ msg_type: 'tick', tick: { quote, epoch, symbol } });
+    if (stream.mode === 'stream') updateStreamCandle(quote, epoch);
   };
 
   const handleError = (error) => {
@@ -1201,6 +1291,15 @@ function getTickStream(symbol) {
       adjust_start_time: 1,
       style: 'ticks',
       req_id: `th:${symbol}`,
+    }));
+    stream.ws.send(JSON.stringify({
+      ticks_history: symbol,
+      count: 3,
+      end: 'latest',
+      adjust_start_time: 1,
+      granularity: stream.granularity,
+      style: 'candles',
+      req_id: `oc:${symbol}`,
     }));
   };
 
@@ -1253,6 +1352,28 @@ function getTickStream(symbol) {
         } else if (h && h.prices && h.prices.length === 0) {
           // no ticks — market may be closed; signal it once
           broadcast({ msg_type: 'market_status', symbol, marketClosed: true, code: 'MarketIsClosed', message: `Market is closed for ${symbol}.` });
+        }
+      } else if (parsed.msg_type === 'candles') {
+        if (parsed.req_id !== `oc:${symbol}`) return;
+        stream.pollInFlight = false;
+        const list = parsed.candles || [];
+        if (list.length === 0) return;
+        // the last candle is the currently forming one; push its latest OHLC
+        const c = list[list.length - 1];
+        if (c.epoch != null && c.open != null) {
+          broadcast({
+            msg_type: 'ohlc',
+            ohlc: {
+              symbol,
+              epoch: c.epoch,
+              open: c.open,
+              high: c.high,
+              low: c.low,
+              close: c.close,
+              volume: c.volume,
+              granularity: stream.granularity,
+            },
+          });
         }
       } else if (parsed.msg_type === 'error') {
         stream.pollInFlight = false;
@@ -1358,6 +1479,70 @@ function releaseContractStream(token, contractId, client) {
   }
 }
 
+// ---------------------------------------------------------------
+// Live balance stream: one authenticated Deriv WS per token,
+// subscribed to `balance` (subscribe: 1) so any account change
+// (buy, sell, win, cashier deposit/withdraw) is pushed to the
+// browser automatically — matching Deriv's real-time balance.
+// ---------------------------------------------------------------
+
+const balanceStreams = new Map(); // token -> { ws, clients: Set, retry }
+
+function getBalanceStream(token) {
+  let stream = balanceStreams.get(token);
+  if (stream) return stream;
+
+  stream = { ws: null, clients: new Set(), retry: 0 };
+  balanceStreams.set(token, stream);
+
+  const connect = () => {
+    stream.ws = new WebSocket(DERIV_TICK_WS);
+    stream.ws.on('open', () => {
+      stream.retry = 0;
+      stream.ws.send(JSON.stringify({ authorize: token }));
+    });
+    stream.ws.on('message', (msg) => {
+      let parsed;
+      try { parsed = JSON.parse(msg); } catch { return; }
+      if (parsed.msg_type === 'authorize') {
+        stream.ws.send(JSON.stringify({ balance: 1, subscribe: 1 }));
+      } else if (parsed.msg_type === 'balance') {
+        const payload = JSON.stringify({ msg_type: 'balance', balance: parsed.balance });
+        for (const client of [...stream.clients]) {
+          if (client.readyState === client.OPEN) client.send(payload);
+        }
+      } else if (parsed.msg_type === 'error') {
+        const payload = JSON.stringify({ msg_type: 'balance_error', error: parsed.error });
+        for (const client of [...stream.clients]) {
+          if (client.readyState === client.OPEN) client.send(payload);
+        }
+      }
+    });
+    stream.ws.on('close', () => {
+      balanceStreams.delete(token);
+      if (stream.clients.size > 0) {
+        const delay = Math.min(1000 * 2 ** stream.retry, 30000);
+        stream.retry += 1;
+        setTimeout(connect, delay);
+      }
+    });
+    stream.ws.on('error', () => { /* close handler owns reconnect */ });
+  };
+
+  connect();
+  return stream;
+}
+
+function releaseBalanceStream(token, client) {
+  const stream = balanceStreams.get(token);
+  if (!stream) return;
+  stream.clients.delete(client);
+  if (stream.clients.size === 0 && stream.ws) {
+    stream.ws.close();
+    balanceStreams.delete(token);
+  }
+}
+
 // SPA fallback: serve index.html for any non-API route
 app.use((req, res) => {
   if (req.path.startsWith('/auth') || req.path.startsWith('/api')) {
@@ -1379,6 +1564,7 @@ wss.on('connection', (ws, req) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const initialSymbol = url.searchParams.get('symbol');
   const initialContract = url.searchParams.get('contract');
+  const initialGranularity = parseInt(url.searchParams.get('granularity'), 10);
   const sessionId = url.searchParams.get('session');
   const account = url.searchParams.get('account');
 
@@ -1387,11 +1573,14 @@ wss.on('connection', (ws, req) => {
 
   ws._symbols = new Set();
   ws._contracts = new Set(); // token:contract_id keys
+  let balanceToken = null;   // token for the live balance subscription
 
-  const subscribeSymbol = (symbol) => {
+  const subscribeSymbol = (symbol, granularity) => {
     if (!symbol || ws._symbols.has(symbol)) return;
     ws._symbols.add(symbol);
-    getTickStream(symbol).clients.add(ws);
+    const stream = getTickStream(symbol);
+    if (granularity) stream.granularity = Math.max(1, Math.min(granularity, 86400));
+    stream.clients.add(ws);
   };
   const unsubscribeSymbol = (symbol) => {
     if (ws._symbols.delete(symbol)) releaseTickStream(symbol, ws);
@@ -1408,8 +1597,18 @@ wss.on('connection', (ws, req) => {
     const key = `${acctData.token}:${contractId}`;
     if (ws._contracts.delete(key)) releaseContractStream(acctData.token, contractId, ws);
   };
+  const subscribeBalance = () => {
+    if (!acctData || balanceToken) return;
+    balanceToken = acctData.token;
+    getBalanceStream(acctData.token).clients.add(ws);
+  };
+  const unsubscribeBalance = () => {
+    if (!balanceToken) return;
+    releaseBalanceStream(balanceToken, ws);
+    balanceToken = null;
+  };
 
-  if (initialSymbol) subscribeSymbol(initialSymbol);
+  if (initialSymbol) subscribeSymbol(initialSymbol, initialGranularity);
   if (initialContract && acctData) subscribeContract(initialContract);
 
   ws.send(JSON.stringify({
@@ -1424,10 +1623,20 @@ wss.on('connection', (ws, req) => {
       if (parsed.action === 'subscribe') {
         if (parsed.symbol) subscribeSymbol(parsed.symbol);
         if (parsed.contract) subscribeContract(parsed.contract);
+        if (parsed.balance) subscribeBalance();
       }
       if (parsed.action === 'unsubscribe') {
         if (parsed.symbol) unsubscribeSymbol(parsed.symbol);
         if (parsed.contract) unsubscribeContract(parsed.contract);
+        if (parsed.balance) unsubscribeBalance();
+      }
+      if (parsed.action === 'set_granularity' && parsed.granularity) {
+        const sym = parsed.symbol || initialSymbol;
+        const gran = parseInt(parsed.granularity, 10);
+        if (sym && gran > 0) {
+          const stream = tickStreams.get(sym);
+          if (stream) stream.granularity = Math.max(1, Math.min(gran, 86400));
+        }
       }
     } catch { /* ignore malformed control messages */ }
   });
@@ -1438,6 +1647,7 @@ wss.on('connection', (ws, req) => {
       const sep = key.indexOf(':');
       releaseContractStream(key.slice(0, sep), key.slice(sep + 1), ws);
     }
+    if (balanceToken) releaseBalanceStream(balanceToken, ws);
   });
 });
 

@@ -39,9 +39,6 @@ export default function TradingViewTab({ theme }) {
   const [marketStatus, setMarketStatus] = useState(null);
   const [refreshKey, setRefreshKey] = useState(0);
 
-  const granRef = useRef(granularity);
-  granRef.current = granularity;
-
   // --- symbol catalog ---
   useEffect(() => {
     let cancelled = false;
@@ -84,7 +81,11 @@ export default function TradingViewTab({ theme }) {
     return () => { cancelled = true; };
   }, [symbol, granularity, refreshKey]);
 
-  // --- live tick WebSocket (reconnects with backoff) ---
+  // --- live tick + candle WebSocket (reconnects with backoff) ---
+  // The server fans out Deriv's real-time feed as `tick` messages for the
+  // tick panel and native `ohlc` messages (open-time labeled candles, the
+  // same shape as Deriv's own `ohlc` stream) that drive the chart. Using
+  // server candles keeps every bucket's open/high/low/close authoritative.
   useEffect(() => {
     if (!symbol) return;
     let ws = null;
@@ -93,25 +94,8 @@ export default function TradingViewTab({ theme }) {
     let retryTimer = null;
 
     const applyTick = (tick) => {
-      const gran = granRef.current;
       const { epoch, quote } = tick;
       if (typeof quote !== 'number') return;
-
-      const bucketEndSec = (Math.floor(epoch / gran) + 1) * gran;
-      const bucketMs = bucketEndSec * 1000;
-
-      setCandles((prev) => {
-        if (prev.length === 0) return prev;
-        const last = prev[prev.length - 1];
-        if (bucketMs > last.t) {
-          const next = [...prev, { t: bucketMs, o: quote, h: quote, l: quote, c: quote, v: 1 }];
-          return next.length > MAX_CANDLES ? next.slice(next.length - MAX_CANDLES) : next;
-        }
-        if (bucketMs < last.t) return prev;
-        const updated = { ...last, h: Math.max(last.h, quote), l: Math.min(last.l, quote), c: quote, v: last.v + 1 };
-        return [...prev.slice(0, -1), updated];
-      });
-
       setLastTick(tick);
       setTickCount((n) => n + 1);
       setTicks((prev) => {
@@ -123,11 +107,27 @@ export default function TradingViewTab({ theme }) {
       });
     };
 
+    const applyOhlc = (o) => {
+      const t = o.epoch * 1000;
+      setCandles((prev) => {
+        if (prev.length === 0) return prev;
+        const last = prev[prev.length - 1];
+        const vol = o.volume != null ? o.volume : 1;
+        if (t > last.t) {
+          const next = [...prev, { t, o: o.open, h: o.high, l: o.low, c: o.close, v: vol }];
+          return next.length > MAX_CANDLES ? next.slice(next.length - MAX_CANDLES) : next;
+        }
+        if (t < last.t) return prev;
+        const updated = { ...last, o: o.open, h: o.high, l: o.low, c: o.close, v: o.volume != null ? o.volume : last.v + 1 };
+        return [...prev.slice(0, -1), updated];
+      });
+    };
+
     const connect = () => {
       if (closed) return;
       setWsStatus('connecting');
       try {
-        ws = new WebSocket(`${WS_BASE}/ws?symbol=${encodeURIComponent(symbol)}`);
+        ws = new WebSocket(`${WS_BASE}/ws?symbol=${encodeURIComponent(symbol)}&granularity=${granularity}`);
       } catch {
         setWsStatus('offline');
         retryTimer = setTimeout(connect, 3000);
@@ -143,6 +143,7 @@ export default function TradingViewTab({ theme }) {
             return;
           }
           if (msg.msg_type === 'tick' && msg.tick) applyTick(msg.tick);
+          if (msg.msg_type === 'ohlc' && msg.ohlc) applyOhlc(msg.ohlc);
         } catch { /* ignore malformed frames */ }
       };
       ws.onclose = () => {
@@ -160,7 +161,7 @@ export default function TradingViewTab({ theme }) {
       clearTimeout(retryTimer);
       try { if (ws) ws.close(); } catch { /* noop */ }
     };
-  }, [symbol]);
+  }, [symbol, granularity]);
 
   const decimals = activeSymbol?.decimals ?? 2;
   const lastClose = candles.length ? candles[candles.length - 1].c : null;

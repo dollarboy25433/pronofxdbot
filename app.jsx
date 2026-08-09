@@ -1,11 +1,11 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, useMemo } from 'react';
 import {
   Play, LayoutGrid, Wrench, LineChart as ChartIcon, Users, Gift,
   Brain, Copy as CopyIcon, User, X, RotateCcw, TrendingUp, TrendingDown,
   GraduationCap, CandlestickChart, Calculator, BookOpen, Radio, Activity,
-  RefreshCw, AlertTriangle, Moon, Sun, Monitor,
+  RefreshCw, AlertTriangle, Moon, Sun, Monitor, Wallet,
 } from 'lucide-react';
-import { createChart, LineSeries, ColorType, CrosshairMode, LineStyle, createSeriesMarkers } from 'lightweight-charts';
+import { createChart, LineSeries, CandlestickSeries, ColorType, CrosshairMode, LineStyle, createSeriesMarkers } from 'lightweight-charts';
 import ClassesTab from './tabs/classes.jsx';
 import TradingViewTab from './tabs/tradingview.jsx';
 import BotBuilderTab from './tabs/botbuilder.jsx';
@@ -66,6 +66,7 @@ export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [sidebarTab, setSidebarTab] = useState('summary');
   const [authModal, setAuthModal] = useState(false);
+  const [cashierModal, setCashierModal] = useState(null); // { mode: 'deposit' | 'withdraw' }
 
   // --- Theme ('dark' | 'light' | 'system') ---
   const [theme, setTheme] = useState(() => {
@@ -90,6 +91,7 @@ export default function App() {
   const [trades, setTrades] = useState([]);
   const [pendingBotXml, setPendingBotXml] = useState(null);
   const intervalRef = useRef(null);
+  const [balanceKey, setBalanceKey] = useState(0);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -131,7 +133,7 @@ export default function App() {
       .then((r) => { if (!r.ok) throw new Error('balance fetch failed'); return r.json(); })
       .then(setBalance)
       .catch(() => setBalance(null));
-  }, [sessionId, selectedAccount]);
+  }, [sessionId, selectedAccount, balanceKey]);
 
   async function handleLogin(mode = 'login') {
     setAuthError(null);
@@ -194,6 +196,12 @@ export default function App() {
     toggleBot();
   }
 
+  // Open the Deriv cashier (deposit/withdraw). Guests are sent to the auth modal.
+  function openCashier(mode) {
+    if (!sessionId) { setAuthModal(true); return; }
+    setCashierModal({ mode: mode === 'withdraw' ? 'withdraw' : 'deposit' });
+  }
+
   function resetStats() {
     clearInterval(intervalRef.current);
     setBotRunning(false);
@@ -240,6 +248,7 @@ export default function App() {
         onLogin={handleLogin}
         onLogout={handleLogout}
         onOpenBotPanel={openBotPanel}
+        onOpenCashier={openCashier}
         theme={theme}
         setTheme={setTheme}
       />
@@ -258,6 +267,7 @@ export default function App() {
               setSelectedAccount={setSelectedAccount}
               balance={balance}
               onLogin={handleLogin}
+              onOpenCashier={openCashier}
             />
           )}
           {activeTab === 'builder' && (
@@ -344,6 +354,18 @@ export default function App() {
             onClose={() => setAuthModal(false)}
             onLogin={() => handleLogin('login')}
             onRegister={() => handleLogin('register')}
+          />
+        )}
+        {cashierModal && sessionId && (
+          <CashierModal
+            mode={cashierModal.mode}
+            sessionId={sessionId}
+            accounts={accounts}
+            selectedAccount={selectedAccount}
+            setSelectedAccount={setSelectedAccount}
+            theme={theme}
+            onClose={() => setCashierModal(null)}
+            onBalanceRefresh={() => setBalanceKey((k) => k + 1)}
           />
         )}
 
@@ -518,7 +540,7 @@ const THEME_OPTIONS = [
   { id: 'system', label: 'System', icon: Monitor },
 ];
 
-function TopNav({ activeTab, setActiveTab, loggedIn, onLogin, onLogout, onOpenBotPanel, theme, setTheme }) {
+function TopNav({ activeTab, setActiveTab, loggedIn, onLogin, onLogout, onOpenBotPanel, onOpenCashier, theme, setTheme }) {
   const [themeOpen, setThemeOpen] = useState(false);
   const themeRef = useRef(null);
 
@@ -578,6 +600,13 @@ function TopNav({ activeTab, setActiveTab, loggedIn, onLogin, onLogout, onOpenBo
               </div>
             )}
           </div>
+          <button
+            className="btn-icon"
+            title="Wallet — deposit & withdraw"
+            onClick={() => onOpenCashier && onOpenCashier('deposit')}
+          >
+            <Wallet size={16} />
+          </button>
           <button
             className="btn-icon"
             title="Run bot"
@@ -715,6 +744,8 @@ function CampaignsTab() {
 
 const ACTIVITY_LABELS = {
   login: 'Logged in',
+  deposit: 'Opened the Deriv cashier (deposit)',
+  withdraw: 'Opened the Deriv cashier (withdraw)',
   bot_run: 'Ran a bot',
   bot_share: 'Shared a bot',
   bot_upload_free: 'Uploaded a free bot',
@@ -727,7 +758,7 @@ const ACTIVITY_LABELS = {
   copy_unfollow: 'Stopped following a strategy',
 };
 
-function DashboardTab({ loggedIn, sessionId, accounts, selectedAccount, setSelectedAccount, balance, onLogin }) {
+function DashboardTab({ loggedIn, sessionId, accounts, selectedAccount, setSelectedAccount, balance, onLogin, onOpenCashier }) {
   const [activity, setActivity] = useState([]);
 
   useEffect(() => {
@@ -770,6 +801,14 @@ function DashboardTab({ loggedIn, sessionId, accounts, selectedAccount, setSelec
               <div className="card-label">Balance</div>
               <div className="balance-value">
                 {balance ? `${balance.balance} ${balance.currency}` : '—'}
+              </div>
+              <div className="balance-actions">
+                <button className="btn-outline btn-small" onClick={() => onOpenCashier && onOpenCashier('deposit')}>
+                  Deposit
+                </button>
+                <button className="btn-outline btn-small" onClick={() => onOpenCashier && onOpenCashier('withdraw')}>
+                  Withdraw
+                </button>
               </div>
             </div>
           </div>
@@ -1803,8 +1842,53 @@ const MT_MARKET_LABELS = {
   cryptocurrency: 'Crypto',
   commodities: 'Commodities',
 };
-const MT_TYPES = ['RISE', 'FALL', 'CALL', 'PUT', 'ASIAU', 'ASIAD'];
-const MT_TYPE_LABELS = { RISE: 'Rise', FALL: 'Fall', CALL: 'Call', PUT: 'Put', ASIAU: 'Asia Up', ASIAD: 'Asia Down' };
+
+// Deriv's trade-type taxonomy (contract_category from `contracts_for`),
+// shown grouped exactly like Deriv's platform trade-type selector.
+const MT_CATEGORY_ORDER = [
+  'risefall', 'callput', 'highlow', 'digits', 'matchdiff', 'asians',
+  'touch', 'endsinout', 'ticks', 'runs', 'reset', 'multipliers',
+  'turbos', 'vanilla', 'accumulators',
+];
+const MT_CATEGORY_NAMES = {
+  risefall: 'Rise/Fall', callput: 'Up/Down', highlow: 'Highs/Lows',
+  digits: 'Digits', matchdiff: 'Matches/Differs', asians: 'Asians',
+  touch: 'Touches/No Touches', endsinout: 'Ends In/Out', ticks: 'Ticks',
+  runs: 'Runs', reset: 'Reset', multipliers: 'Multipliers',
+  turbos: 'Turbos', vanilla: 'Vanilla', accumulators: 'Accumulators',
+};
+
+// Trade types that only need a duration + stake (+ optional barrier) to
+// price through `proposal`. Exotic types (multipliers/turbos/vanilla/
+// accumulators) are shown but greyed out — they need extra parameters.
+const MT_ENABLED_CATEGORIES = new Set([
+  'risefall', 'callput', 'highlow', 'digits', 'matchdiff', 'asians',
+  'touch', 'endsinout', 'ticks', 'runs',
+]);
+
+// Digit trades predict the last digit, passed to `proposal` via `barrier`.
+const MT_DIGIT_CATEGORIES = new Set(['digits', 'matchdiff']);
+
+const MT_TYPE_NAMES = {
+  RISE: 'Rise', FALL: 'Fall',
+  CALLE: 'Rise (Allow Equals)', PUTE: 'Fall (Allow Equals)',
+  CALL: 'Higher', PUT: 'Lower',
+  HIGHER: 'High', LOWER: 'Low',
+  ASIANU: 'Asia Up', ASIAND: 'Asia Down',
+  DIGITMATCH: 'Matches', DIGITDIFF: 'Differs',
+  DIGITEVEN: 'Even', DIGITODD: 'Odd',
+  DIGITOVER: 'Over', DIGITUNDER: 'Under',
+  ONETOUCH: 'Touch', NOTOUCH: 'No Touch',
+  EXPIRYRANGE: 'Ends In', EXPIRYRANGEE: 'Ends Out',
+  EXPIRYMISS: 'Ends In', EXPIRYMISSE: 'Ends Out',
+  TICKHIGH: 'High', TICKLOW: 'Low',
+  RUNHIGH: 'High', RUNLOW: 'Low',
+  MULTUP: 'Up', MULTDOWN: 'Down',
+  ACCU: 'Accumulator',
+  RESETCALL: 'Reset Call', RESETPUT: 'Reset Put',
+  VANILLALONGCALL: 'Vanilla Call', VANILLALONGPUT: 'Vanilla Put',
+  TURBOSLONG: 'Turbo Long', TURBOSSHORT: 'Turbo Short',
+};
 const MT_UNIT_LABELS = { t: 'ticks', s: 'sec', m: 'min', h: 'hrs', d: 'days' };
 const MT_UNIT_SECONDS = { s: 1, m: 60, h: 3600, d: 86400 };
 
@@ -1824,12 +1908,17 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
   const [symbolsError, setSymbolsError] = useState(null);
   const [symbol, setSymbol] = useState(null);
 
-  const [contractTypes, setContractTypes] = useState([]);
+  const [contractCategories, setContractCategories] = useState([]);
+  const [category, setCategory] = useState(null);
   const [contractType, setContractType] = useState(null);
 
   const [duration, setDuration] = useState(5);
   const [durationUnit, setDurationUnit] = useState('t');
   const [stake, setStake] = useState(10);
+  const [basis, setBasis] = useState('stake'); // 'stake' | 'payout'
+  const [barrier, setBarrier] = useState('');
+  const [barrier2, setBarrier2] = useState('');
+  const [disabledNotice, setDisabledNotice] = useState(null);
 
   const [proposal, setProposal] = useState(null);
   const [proposalLoading, setProposalLoading] = useState(false);
@@ -1859,6 +1948,12 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
   const activeSymbol = symbols.find((s) => s.symbol === symbol) || null;
   const decimals = activeSymbol?.decimals ?? 2;
 
+  const selectedCat = contractCategories.find((c) => c.category === category) || null;
+  const selectedType = (selectedCat?.types || []).find((t) => t.contract_type === contractType) || null;
+  const isDigitCat = selectedCat ? MT_DIGIT_CATEGORIES.has(selectedCat.category) : false;
+  const barrierCount = selectedType?.barriers ?? 0;
+  const typeLabel = selectedType?.label || MT_TYPE_NAMES[contractType] || contractType || 'contract';
+
   // --- symbol catalog (live from Deriv) ---
   useEffect(() => {
     let cancelled = false;
@@ -1879,7 +1974,8 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
     setSymbol(preferred.symbol);
   }, [symbols, symbol]);
 
-  // --- available contract types for the symbol on this account ---
+  // --- available contract types for the symbol on this account, grouped by
+  // Deriv's trade-type category (Rise/Fall, Up/Down, Digits, Asians, ...) ---
   useEffect(() => {
     if (!symbol || !sessionId || !selectedAccount) return;
     let cancelled = false;
@@ -1888,29 +1984,68 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
       .then((data) => {
         if (cancelled) return;
         const avail = (data.contracts_for && data.contracts_for.available) || [];
-        const supported = avail
-          .filter((a) => MT_TYPES.includes(a.contract_type))
-          .map((a) => ({
-            type: a.contract_type,
-            label: MT_TYPE_LABELS[a.contract_type] || a.display_name,
-            units: (a.duration_units || []).filter((u) => MT_UNIT_LABELS[u]),
-            min: a.duration_min ?? 1,
-            max: a.duration_max ?? 9999,
-          }));
-        setContractTypes(supported);
-        setContractType((prev) => (supported.some((s) => s.type === prev) ? prev : (supported[0] ? supported[0].type : null)));
+        const grouped = new Map();
+        for (const a of avail) {
+          const key = a.contract_category || 'other';
+          if (!grouped.has(key)) grouped.set(key, []);
+          grouped.get(key).push(a);
+        }
+        const buildTypes = (list) => list.map((a) => ({
+          contract_type: a.contract_type,
+          label: MT_TYPE_NAMES[a.contract_type] || a.contract_display || a.contract_type,
+          barriers: a.barriers ?? 0,
+          units: (a.duration_units || []).filter((u) => MT_UNIT_LABELS[u]),
+          min: a.duration_min ?? 1,
+          max: a.duration_max ?? 9999,
+        }));
+        const cats = MT_CATEGORY_ORDER
+          .filter((c) => grouped.has(c))
+          .map((c) => ({
+            category: c,
+            label: MT_CATEGORY_NAMES[c] || grouped.get(c)[0].contract_category_display || c,
+            enabled: MT_ENABLED_CATEGORIES.has(c),
+            types: buildTypes(grouped.get(c)),
+          }))
+          .concat(
+            [...grouped.entries()]
+              .filter(([c]) => !MT_CATEGORY_ORDER.includes(c))
+              .map(([c, list]) => ({
+                category: c,
+                label: list[0].contract_category_display || c,
+                enabled: false,
+                types: buildTypes(list),
+              }))
+          );
+        setContractCategories(cats);
+        const firstEnabled = cats.find((c) => c.enabled) || cats[0];
+        setCategory((prev) => (cats.some((c) => c.category === prev) ? prev : (firstEnabled ? firstEnabled.category : null)));
+        setContractType((prev) =>
+          (prev && cats.some((c) => c.types.some((t) => t.contract_type === prev))
+            ? prev
+            : (firstEnabled && firstEnabled.types[0] ? firstEnabled.types[0].contract_type : null))
+        );
       })
-      .catch(() => { if (!cancelled) setContractTypes([]); });
+      .catch(() => { if (!cancelled) setContractCategories([]); });
     return () => { cancelled = true; };
   }, [symbol, sessionId, selectedAccount]);
 
   // keep duration/unit valid for the selected contract type
   useEffect(() => {
-    const ct = contractTypes.find((c) => c.type === contractType);
+    const cat = contractCategories.find((c) => c.category === category);
+    const ct = cat && cat.types.find((t) => t.contract_type === contractType);
     if (!ct) return;
     setDurationUnit((prev) => (ct.units.includes(prev) ? prev : (ct.units[0] || 'm')));
     setDuration((d) => Math.max(ct.min, Math.min(ct.max, Number(d) || ct.min)));
-  }, [contractType, contractTypes]);
+  }, [category, contractType, contractCategories]);
+
+  // reset barrier inputs whenever the trade type changes
+  useEffect(() => {
+    const cat = contractCategories.find((c) => c.category === category);
+    const digit = cat ? MT_DIGIT_CATEGORIES.has(cat.category) : false;
+    setBarrier(digit ? (barrier || '5') : '');
+    setBarrier2('');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [category, contractType, contractCategories]);
 
   // --- live symbol ticks + contract updates over one socket ---
   const applyTick = (tick) => {
@@ -1957,6 +2092,20 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
     } catch { /* keep last known balance */ }
   }
 
+  // Select a Deriv trade-type category; exotic categories stay greyed out.
+  const pickCategory = (c) => {
+    if (!c.enabled) {
+      setDisabledNotice(`${c.label} requires extra parameters and isn't supported in Manual Trader yet.`);
+      return;
+    }
+    setDisabledNotice(null);
+    setCategory(c.category);
+    setContractType((prev) => (c.types.some((t) => t.contract_type === prev) ? prev : (c.types[0] ? c.types[0].contract_type : null)));
+    setBarrier(MT_DIGIT_CATEGORIES.has(c.category) ? '5' : '');
+    setBarrier2('');
+    setResult(null);
+  };
+
   useEffect(() => {
     if (!symbol || !sessionId || !selectedAccount) return;
     let closed = false;
@@ -1972,6 +2121,7 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
         ws.onopen = () => {
           retry = 0;
           setWsStatus('live');
+          ws.send(JSON.stringify({ action: 'subscribe', balance: true }));
           if (contractIdRef.current) {
             ws.send(JSON.stringify({ action: 'subscribe', contract: contractIdRef.current }));
           }
@@ -1983,6 +2133,7 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
               setMarketStatus(msg);
               return;
             }
+            if (msg.msg_type === 'balance' && msg.balance) onBalanceUpdate(msg.balance);
             if (msg.msg_type === 'tick' && msg.tick) applyTick(msg.tick);
             if (msg.msg_type === 'proposal_open_contract' && msg.proposal_open_contract) applyContract(msg.proposal_open_contract);
           } catch { /* ignore malformed frames */ }
@@ -2048,10 +2199,12 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
           symbol,
           contract_type: contractType,
           amount: stake,
-          basis: 'stake',
+          basis,
           duration,
           duration_unit: durationUnit,
           currency,
+          barrier: barrier || undefined,
+          barrier2: barrier2 || undefined,
         }),
       })
         .then(async (r) => {
@@ -2063,7 +2216,7 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
         .finally(() => { if (!cancelled) setProposalLoading(false); });
     }, 250);
     return () => { cancelled = true; clearTimeout(t); };
-  }, [sessionId, selectedAccount, symbol, contractType, stake, duration, durationUnit, currency, contractMeta]);
+  }, [sessionId, selectedAccount, symbol, contractType, stake, basis, duration, durationUnit, currency, barrier, barrier2, contractMeta]);
 
   // --- buy a real contract ---
   async function handleBuy() {
@@ -2093,8 +2246,6 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
         longcode: proposal.longcode,
       });
       setContract(null);
-      setTicks([]);
-      setLastTick(null);
       refreshBalance();
     } catch (e) {
       setActionError(e.message);
@@ -2152,6 +2303,9 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
     ? { price: contract.entry_spot, time: contract.entry_tick_time }
     : (contractMeta?.entry_spot != null ? { price: contractMeta.entry_spot, time: contractMeta.entry_tick_time } : null);
   const profitEstimate = proposal ? proposal.payout - proposal.ask_price : null;
+
+  // 1-second candles from the live tick feed for the trade chart
+  const candles = useMemo(() => aggregateCandles(ticks, 1), [ticks]);
 
   const wsLabel = wsStatus === 'live' ? 'Live' : wsStatus === 'connecting' ? 'Connecting' : 'Offline';
   const wsClass = wsStatus === 'live' ? 'tv-live' : wsStatus === 'connecting' ? 'tv-connecting' : 'tv-offline';
@@ -2218,23 +2372,44 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
 
           <div className="mt-market-type">
             <div className="mt-market-row"><span>Market</span><b>{activeSymbol ? (MT_MARKET_LABELS[activeSymbol.market] || activeSymbol.market) : '—'}</b></div>
-            <div className="mt-market-row"><span>Contract</span><b>{contractType ? MT_TYPE_LABELS[contractType] : '—'}</b></div>
+            <div className="mt-market-row"><span>Contract</span><b>{contractType ? typeLabel : '—'}</b></div>
             <div className="mt-market-row"><span>Duration</span><b>{duration}{MT_UNIT_LABELS[durationUnit] ? ` ${MT_UNIT_LABELS[durationUnit]}` : ''}</b></div>
           </div>
 
-          <label className="card-label">Contract type</label>
-          <div className="mt-types">
-            {contractTypes.map((ct) => (
+          <label className="card-label">Trade type</label>
+          {disabledNotice && (
+            <div className="mt-error"><AlertTriangle size={13} /> {disabledNotice}</div>
+          )}
+          <div className="mt-categories">
+            {contractCategories.map((c) => (
               <button
-                key={ct.type}
-                className={`mt-type-btn ${contractType === ct.type ? 'mt-type-active' : ''}`}
-                onClick={() => { setContractType(ct.type); setResult(null); }}
+                key={c.category}
+                className={`mt-cat-btn ${category === c.category ? 'mt-cat-active' : ''} ${c.enabled ? '' : 'mt-cat-disabled'}`}
+                onClick={() => pickCategory(c)}
+                title={c.enabled ? undefined : 'Requires extra parameters — not available in Manual Trader yet.'}
               >
-                {ct.label}
+                {c.label}
               </button>
             ))}
-            {contractTypes.length === 0 && <span className="mt-hint">No tradable contract types returned for this symbol.</span>}
+            {contractCategories.length === 0 && <span className="mt-hint">No tradable contract types returned for this symbol.</span>}
           </div>
+
+          {selectedCat && (
+            <>
+              <label className="card-label">{selectedCat.label}</label>
+              <div className="mt-types">
+                {selectedCat.types.map((t) => (
+                  <button
+                    key={t.contract_type}
+                    className={`mt-type-btn ${contractType === t.contract_type ? 'mt-type-active' : ''}`}
+                    onClick={() => { setContractType(t.contract_type); setBarrier(''); setBarrier2(''); setResult(null); }}
+                  >
+                    {t.label}
+                  </button>
+                ))}
+              </div>
+            </>
+          )}
 
           <label className="card-label">Duration</label>
           <div className="mt-duration">
@@ -2246,7 +2421,7 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
               onChange={(e) => setDuration(Number(e.target.value))}
             />
             <div className="mt-units">
-              {(contractTypes.find((c) => c.type === contractType)?.units || ['t', 'm', 'h']).map((u) => (
+              {(selectedType?.units || ['t', 'm', 'h']).map((u) => (
                 <button
                   key={u}
                   className={`mt-unit-btn ${durationUnit === u ? 'mt-unit-active' : ''}`}
@@ -2258,7 +2433,63 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
             </div>
           </div>
 
-          <label className="card-label">Stake ({currency})</label>
+          {isDigitCat && (
+            <>
+              <label className="card-label">Last digit prediction</label>
+              <div className="mt-digits">
+                {Array.from({ length: 10 }, (_, d) => (
+                  <button
+                    key={d}
+                    className={`mt-digit-btn ${barrier === String(d) ? 'mt-digit-active' : ''}`}
+                    onClick={() => setBarrier(String(d))}
+                  >
+                    {d}
+                  </button>
+                ))}
+              </div>
+            </>
+          )}
+
+          {!isDigitCat && barrierCount >= 1 && (
+            <>
+              <label className="card-label">Barrier {barrierCount >= 2 ? '(high)' : ''}</label>
+              <input
+                className="select"
+                type="text"
+                value={barrier}
+                placeholder={barrierCount >= 2 ? 'e.g. +5.0' : 'e.g. +5.0 or 12000'}
+                onChange={(e) => setBarrier(e.target.value)}
+              />
+            </>
+          )}
+
+          {!isDigitCat && barrierCount >= 2 && (
+            <>
+              <label className="card-label">Barrier (low)</label>
+              <input
+                className="select"
+                type="text"
+                value={barrier2}
+                placeholder="e.g. -5.0"
+                onChange={(e) => setBarrier2(e.target.value)}
+              />
+            </>
+          )}
+
+          <label className="card-label">Amount basis</label>
+          <div className="mt-units">
+            {['stake', 'payout'].map((b) => (
+              <button
+                key={b}
+                className={`mt-unit-btn ${basis === b ? 'mt-unit-active' : ''}`}
+                onClick={() => setBasis(b)}
+              >
+                {b === 'stake' ? 'Stake' : 'Payout'}
+              </button>
+            ))}
+          </div>
+
+          <label className="card-label">{basis === 'payout' ? `Payout (${currency})` : `Stake (${currency})`}</label>
           <input
             className="select"
             type="number"
@@ -2285,7 +2516,14 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
           )}
 
           <button className="btn-buy mt-buy" onClick={handleBuy} disabled={!proposal || busy || !!contractMeta}>
-            {busy ? 'Buying…' : `Buy ${contractType ? MT_TYPE_LABELS[contractType] : 'contract'}`}
+            <span className="mt-buy-label">{busy ? 'Buying…' : `Buy ${typeLabel}`}</span>
+            {proposal && !busy && (
+              <span className="mt-buy-sub">
+                {basis === 'payout'
+                  ? `${proposal.ask_price.toLocaleString(undefined, { maximumFractionDigits: 2 })} ${currency} stake · ${stake.toLocaleString(undefined, { maximumFractionDigits: 2 })} payout`
+                  : `Payout ${proposal.payout.toLocaleString(undefined, { maximumFractionDigits: 2 })} ${currency}`}
+              </span>
+            )}
           </button>
 
           {contractMeta && (
@@ -2312,7 +2550,7 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
         <div className="card mt-chart-card">
           <div className="mt-chart-top">
             <span className="mt-type-badge">
-              {symbol || '—'} · {contractType ? MT_TYPE_LABELS[contractType] : '—'} · {duration} {MT_UNIT_LABELS[durationUnit]}
+              {symbol || '—'} · {contractType ? typeLabel : '—'} · {duration} {MT_UNIT_LABELS[durationUnit]}
             </span>
             {contractMeta && isTickContract && (
               <span className="mt-timer">⏱ {remainingTicks == null ? '—' : `${remainingTicks} ticks left`}</span>
@@ -2322,20 +2560,20 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
             )}
           </div>
 
-          {contractMeta ? (
-            <LineFeedChart
-              points={ticks}
+          {candles.length === 0 ? (
+            <div className="tv-empty mt-empty-chart">
+              <Activity size={18} />
+              <span>Live 1s candles — waiting for ticks…</span>
+            </div>
+          ) : (
+            <CandleFeedChart
+              candles={candles}
               decimals={decimals}
               entryPoint={entryPoint}
               lastPrice={lastPrice}
               direction={contractType}
               theme={theme}
             />
-          ) : (
-            <div className="tv-empty mt-empty-chart">
-              <Activity size={18} />
-              <span>Live spot feed ready — buy a contract to start the trade chart.</span>
-            </div>
           )}
 
           <div className="mt-strip">
@@ -2496,6 +2734,172 @@ function LineFeedChart({ points, decimals, entryPoint, lastPrice, direction, the
   return <div className="mt-chart-canvas" ref={containerRef} />;
 }
 
+// ---------------------------------------------------------------------
+// Aggregate the live tick feed into OHLC candles (seconds). Used for the
+// Manual Trader's 1s trade chart; the bucket time is the candle's OPEN
+// time so it lines up with the contract's entry_tick_time marker.
+// ---------------------------------------------------------------------
+
+function aggregateCandles(ticks, granSec) {
+  const map = new Map();
+  for (const t of ticks) {
+    if (t == null || t.t == null || t.price == null) continue;
+    const bucket = Math.floor(t.t / granSec) * granSec;
+    let c = map.get(bucket);
+    if (!c) {
+      map.set(bucket, { t: bucket * 1000, o: t.price, h: t.price, l: t.price, c: t.price });
+    } else {
+      if (t.price > c.h) c.h = t.price;
+      if (t.price < c.l) c.l = t.price;
+      c.c = t.price;
+    }
+  }
+  return [...map.values()].sort((a, b) => a.t - b.t);
+}
+
+// ---------------------------------------------------------------------
+// Live candlestick chart for the Manual Trader (lightweight-charts v5).
+// Mirrors Deriv's DTrader chart: live candles for the symbol, a dashed
+// entry line + arrow where the contract opened, and a dotted current
+// price line. Updates incrementally without rebuilding the chart.
+// ---------------------------------------------------------------------
+
+function CandleFeedChart({ candles, decimals, entryPoint, lastPrice, direction, theme }) {
+  const containerRef = useRef(null);
+  const chartRef = useRef(null);
+  const seriesRef = useRef(null);
+  const entryLineRef = useRef(null);
+  const currentLineRef = useRef(null);
+  const markersRef = useRef(null);
+  const appliedLen = useRef(0);
+
+  const toBar = (c) => ({ time: Math.floor(c.t / 1000), open: c.o, high: c.h, low: c.l, close: c.c });
+
+  const systemLight = typeof window !== 'undefined' && window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches;
+  const isLight = theme === 'light' || (theme === 'system' && systemLight);
+  const colors = isLight
+    ? { bg: '#ffffff', text: '#5c6672', grid: '#eef0f3', border: '#dfe3e8', crosshair: 'rgba(22,24,29,0.25)', labelBg: '#eef0f3' }
+    : { bg: '#14181d', text: '#8b93a1', grid: '#1d2229', border: '#23282f', crosshair: 'rgba(242,243,245,0.3)', labelBg: '#23282f' };
+
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+
+    const chart = createChart(container, {
+      autoSize: true,
+      layout: {
+        background: { type: ColorType.Solid, color: colors.bg },
+        textColor: colors.text,
+        fontSize: 11,
+        fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
+        attributionLogo: false,
+      },
+      grid: { vertLines: { color: colors.grid }, horzLines: { color: colors.grid } },
+      timeScale: { timeVisible: true, secondsVisible: true, borderColor: colors.border, rightOffset: 3 },
+      rightPriceScale: { borderColor: colors.border },
+      crosshair: {
+        mode: CrosshairMode.Normal,
+        vertLine: { color: colors.crosshair, labelBackgroundColor: colors.labelBg },
+        horzLine: { color: colors.crosshair, labelBackgroundColor: colors.labelBg },
+      },
+    });
+
+    const series = chart.addSeries(CandlestickSeries, {
+      upColor: '#00d0a0',
+      downColor: '#ff444f',
+      borderVisible: false,
+      wickUpColor: '#00d0a0',
+      wickDownColor: '#ff444f',
+      priceFormat: { type: 'price', precision: decimals, minMove: 1 / Math.pow(10, decimals) },
+    });
+    markersRef.current = createSeriesMarkers(series, []);
+
+    chartRef.current = chart;
+    seriesRef.current = series;
+    appliedLen.current = 0;
+
+    return () => {
+      chart.remove();
+      chartRef.current = null;
+      seriesRef.current = null;
+      entryLineRef.current = null;
+      currentLineRef.current = null;
+      markersRef.current = null;
+      appliedLen.current = 0;
+    };
+  }, [decimals, colors.bg, colors.text, colors.grid, colors.border, colors.crosshair, colors.labelBg]);
+
+  // push live candles incrementally (full reset when a new set arrives)
+  useEffect(() => {
+    const series = seriesRef.current;
+    if (!series) return;
+    if (candles.length === 0) {
+      series.setData([]);
+      appliedLen.current = 0;
+      return;
+    }
+    const prev = appliedLen.current;
+    if (prev === 0 || prev > candles.length || candles.length > prev + 1) {
+      series.setData(candles.map(toBar));
+    } else if (prev < candles.length) {
+      series.update(toBar(candles[candles.length - 1]));
+    }
+    appliedLen.current = candles.length;
+    chartRef.current?.timeScale().scrollToRealTime();
+  }, [candles]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // entry price line + arrow marker
+  useEffect(() => {
+    const series = seriesRef.current;
+    if (!series) return;
+    if (entryLineRef.current) {
+      try { series.removePriceLine(entryLineRef.current); } catch { /* noop */ }
+      entryLineRef.current = null;
+    }
+    markersRef.current?.setMarkers([]);
+    if (entryPoint && typeof entryPoint.price === 'number') {
+      entryLineRef.current = series.createPriceLine({
+        price: entryPoint.price,
+        color: '#ffb224',
+        lineWidth: 1,
+        lineStyle: LineStyle.Dashed,
+        title: 'Entry',
+        axisLabelVisible: true,
+      });
+      if (entryPoint.time) {
+        const up = direction === 'RISE' || direction === 'CALL' || direction === 'ASIAU' || direction === 'UPORDOWN';
+        markersRef.current?.setMarkers([{
+          time: entryPoint.time,
+          position: up ? 'belowBar' : 'aboveBar',
+          color: up ? '#00d0a0' : '#ff444f',
+          shape: up ? 'arrowUp' : 'arrowDown',
+          text: 'Entry',
+        }]);
+      }
+    }
+  }, [entryPoint, direction]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // dotted current-price line
+  useEffect(() => {
+    const series = seriesRef.current;
+    if (!series || lastPrice == null) return;
+    if (currentLineRef.current) {
+      currentLineRef.current.applyOptions({ price: lastPrice });
+    } else {
+      currentLineRef.current = series.createPriceLine({
+        price: lastPrice,
+        color: '#4c6ef5',
+        lineWidth: 1,
+        lineStyle: LineStyle.Dotted,
+        title: 'Current',
+        axisLabelVisible: true,
+      });
+    }
+  }, [lastPrice]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  return <div className="mt-chart-canvas" ref={containerRef} />;
+}
+
 // ---------------- Bot runner (big modal) ----------------
 
 function BotSidebar({ sidebarTab, setSidebarTab, botRunning, toggleBot, resetStats, stats, profitLoss, currency, openContracts, trades, onClose }) {
@@ -2610,6 +3014,211 @@ function AuthModal({ onClose, onLogin, onRegister }) {
           <button className="btn-ghost" onClick={onRegister}>Sign up</button>
         </div>
         <span className="auth-note">Secure OAuth sign-in via Deriv. We never store your password.</span>
+      </div>
+    </div>
+  );
+}
+
+// ---------------- Deposit / Withdraw (Deriv cashier) modal ----------------
+
+function CashierModal({ mode, sessionId, accounts, selectedAccount, setSelectedAccount, theme, onClose, onBalanceRefresh }) {
+  const [activeMode, setActiveMode] = useState(mode);
+  const [url, setUrl] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const [needCode, setNeedCode] = useState(false);
+  const [codeSent, setCodeSent] = useState(false);
+  const [code, setCode] = useState('');
+  const [sendingCode, setSendingCode] = useState(false);
+  const [iframeKey, setIframeKey] = useState(0);
+
+  const dark = theme !== 'light';
+
+  function loadCashier(nextMode, verificationCode) {
+    if (!sessionId || !selectedAccount) return;
+    setLoading(true);
+    setError(null);
+    setUrl(null);
+    setNeedCode(false);
+    setCodeSent(false);
+    fetch(`${API_BASE}/api/cashier`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        session: sessionId,
+        account: selectedAccount,
+        action: nextMode,
+        verification_code: verificationCode,
+      }),
+    })
+      .then(async (r) => {
+        const data = await r.json();
+        if (!r.ok) {
+          if (data.needVerification) { setNeedCode(true); return; }
+          throw new Error(data.error || 'Could not open the Deriv cashier.');
+        }
+        if (!data.url) throw new Error('Deriv did not return a cashier page for this account.');
+        setUrl(data.url);
+        setIframeKey((k) => k + 1);
+      })
+      .catch((e) => setError(e.message))
+      .finally(() => setLoading(false));
+  }
+
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => { loadCashier(activeMode); }, [selectedAccount, activeMode]);
+
+  function switchMode(m) {
+    if (m === activeMode) return;
+    setActiveMode(m);
+    setCode('');
+    setCodeSent(false);
+    loadCashier(m);
+  }
+
+  function handleSendCode() {
+    if (!sessionId) return;
+    setSendingCode(true);
+    setError(null);
+    fetch(`${API_BASE}/api/cashier/verify-email`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session: sessionId, account: selectedAccount, type: 'withdraw' }),
+    })
+      .then(async (r) => {
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.error || 'Could not send the verification code.');
+        setCodeSent(true);
+      })
+      .catch((e) => setError(e.message))
+      .finally(() => setSendingCode(false));
+  }
+
+  function handleSubmitCode(e) {
+    e.preventDefault();
+    if (!code.trim()) return;
+    loadCashier('withdraw', code.trim());
+  }
+
+  function close() {
+    onClose();
+    if (onBalanceRefresh) onBalanceRefresh();
+  }
+
+  const iframeUrl = url
+    ? `${url}${url.includes('?') ? '&' : '?'}DarkMode=${dark ? 'on' : 'off'}`
+    : null;
+
+  return (
+    <div className="modal-overlay" onClick={close}>
+      <div className="cashier-modal" role="dialog" aria-modal="true" onClick={(e) => e.stopPropagation()}>
+        <div className="cashier-head">
+          <div className="cashier-title">
+            <Wallet size={16} />
+            <span>Cashier</span>
+          </div>
+          <div className="cashier-head-right">
+            <select
+              className="select cashier-account"
+              value={selectedAccount || ''}
+              onChange={(e) => setSelectedAccount(e.target.value)}
+            >
+              {accounts.map((a) => (
+                <option key={a.account} value={a.account}>{a.account} ({a.currency})</option>
+              ))}
+            </select>
+            <button className="btn-icon" onClick={close} aria-label="Close"><X size={16} /></button>
+          </div>
+        </div>
+
+        <div className="pill-row cashier-tabs">
+          <button className={`pill ${activeMode === 'deposit' ? 'pill-active' : ''}`} onClick={() => switchMode('deposit')}>
+            Deposit
+          </button>
+          <button className={`pill ${activeMode === 'withdraw' ? 'pill-active' : ''}`} onClick={() => switchMode('withdraw')}>
+            Withdraw
+          </button>
+        </div>
+
+        {loading && (
+          <div className="cashier-state">
+            <RefreshCw size={22} className="cashier-spin" />
+            <p>Opening the Deriv cashier…</p>
+          </div>
+        )}
+
+        {!loading && error && !needCode && (
+          <div className="cashier-state">
+            <div className="mt-error" style={{ marginBottom: 12 }}>
+              <AlertTriangle size={14} />
+              <span>{error}</span>
+            </div>
+            <button className="btn-outline btn-small" onClick={() => loadCashier(activeMode)}>Try again</button>
+            <p className="mt-hint" style={{ marginTop: 12 }}>
+              You can also fund or withdraw directly on Deriv:&nbsp;
+              <a href="https://app.deriv.com/cashier/deposit" target="_blank" rel="noopener noreferrer">Deposit</a>
+              {' · '}
+              <a href="https://app.deriv.com/cashier/withdrawal" target="_blank" rel="noopener noreferrer">Withdraw</a>
+            </p>
+          </div>
+        )}
+
+        {!loading && needCode && (
+          <div className="cashier-state">
+            <div className="booking-done-mark" style={{ width: 40, height: 40, fontSize: 18 }}>✉</div>
+            <p className="cashier-verify-text">
+              <strong>Verify your withdrawal</strong>
+            </p>
+            <p className="cashier-verify-text">
+              Deriv will email a one-time verification code to the address linked to your account.
+            </p>
+            {!codeSent ? (
+              <button className="btn-primary" onClick={handleSendCode} disabled={sendingCode}>
+                {sendingCode ? 'Sending…' : 'Send verification code'}
+              </button>
+            ) : (
+              <form className="cashier-code-form" onSubmit={handleSubmitCode}>
+                <input
+                  className="booking-input cashier-code-input"
+                  type="text"
+                  inputMode="numeric"
+                  placeholder="Enter the code from your email"
+                  value={code}
+                  onChange={(e) => setCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                  required
+                />
+                <button className="btn-primary" type="submit">Verify & continue</button>
+                <button className="btn-ghost" type="button" onClick={handleSendCode}>Resend code</button>
+              </form>
+            )}
+          </div>
+        )}
+
+        {!loading && iframeUrl && (
+          <>
+            <div className="cashier-frame-wrap">
+              <iframe
+                key={iframeKey}
+                src={iframeUrl}
+                title="Deriv cashier"
+                className="cashier-frame"
+                allow="payment"
+              />
+            </div>
+            <div className="cashier-actions">
+              <a className="btn-outline btn-small" href={iframeUrl} target="_blank" rel="noopener noreferrer">
+                Open in new tab
+              </a>
+              <button className="btn-outline btn-small" onClick={() => loadCashier(activeMode)}>
+                <RefreshCw size={13} /> Reload
+              </button>
+            </div>
+          </>
+        )}
+
+        <p className="cashier-note">
+          Payments run entirely on Deriv's official cashier — your funds go straight to your selected Deriv account.
+        </p>
       </div>
     </div>
   );
@@ -2833,6 +3442,16 @@ function GlobalStyle() {
       .mt-types { display: flex; gap: 6px; flex-wrap: wrap; }
       .mt-type-btn { background: var(--panel-2); border: 1px solid var(--border); color: var(--text-muted); border-radius: 8px; padding: 8px 12px; font-size: 12px; font-weight: 600; cursor: pointer; }
       .mt-type-active { background: rgba(255,68,79,0.12); border-color: var(--accent-red); color: var(--accent-red); }
+      .mt-categories { display: flex; gap: 6px; flex-wrap: wrap; }
+      .mt-cat-btn { background: var(--panel-2); border: 1px solid var(--border); color: var(--text-muted); border-radius: 999px; padding: 6px 12px; font-size: 12px; font-weight: 600; cursor: pointer; }
+      .mt-cat-active { background: var(--panel); border-color: var(--accent-indigo); color: var(--text); }
+      .mt-cat-disabled { opacity: 0.45; cursor: not-allowed; text-decoration: line-through; }
+      .mt-digits { display: flex; gap: 5px; flex-wrap: wrap; }
+      .mt-digit-btn { flex: 0 0 38px; background: var(--panel-2); border: 1px solid var(--border); color: var(--text-muted); border-radius: 8px; padding: 8px 0; font-size: 13px; font-weight: 700; cursor: pointer; }
+      .mt-digit-active { background: rgba(255,68,79,0.12); border-color: var(--accent-red); color: var(--accent-red); }
+      .mt-buy { display: flex; flex-direction: column; align-items: center; gap: 2px; }
+      .mt-buy-label { font-weight: 700; }
+      .mt-buy-sub { font-size: 11px; opacity: 0.85; }
       .mt-duration { display: flex; gap: 8px; }
       .mt-duration-input { flex: 0 0 96px; }
       .mt-units { display: flex; gap: 4px; flex-wrap: wrap; background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; padding: 3px; }
@@ -2909,6 +3528,29 @@ function GlobalStyle() {
       .auth-actions { display: flex; gap: 10px; width: 100%; }
       .auth-actions .btn-primary, .auth-actions .btn-ghost { flex: 1; padding: 12px; }
       .auth-note { font-size: 11px; color: var(--text-muted); margin-top: 14px; line-height: 1.5; }
+
+      .cashier-modal { width: min(680px, 96vw); max-height: 92dvh; overflow-y: auto; overscroll-behavior: contain; background: var(--panel); border: 1px solid var(--border); border-radius: 18px; padding: 18px; display: flex; flex-direction: column; gap: 12px; box-shadow: 0 24px 80px rgba(0,0,0,0.55); }
+      .cashier-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+      .cashier-title { display: flex; align-items: center; gap: 8px; font-size: 16px; font-weight: 800; }
+      .cashier-head-right { display: flex; align-items: center; gap: 8px; }
+      .cashier-account { width: auto; min-width: 150px; padding: 7px 10px; }
+      .cashier-tabs { margin: 0; }
+      .cashier-state { display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; gap: 10px; padding: 40px 16px; min-height: 360px; }
+      .cashier-state .mt-error { align-self: stretch; text-align: left; }
+      .cashier-state a { color: var(--accent-teal); text-decoration: none; font-weight: 600; }
+      .cashier-state a:hover { text-decoration: underline; }
+      .cashier-verify-text { margin: 0; font-size: 13px; color: var(--text-muted); line-height: 1.6; }
+      .cashier-verify-text strong { color: var(--text); font-size: 15px; }
+      .cashier-code-form { display: flex; flex-direction: column; gap: 10px; width: 100%; max-width: 320px; }
+      .cashier-code-input { text-align: center; font-size: 18px; letter-spacing: 0.3em; }
+      .cashier-frame-wrap { flex: 1; min-height: 520px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+      .cashier-frame { width: 100%; height: 100%; min-height: 520px; border: none; display: block; }
+      .cashier-actions { display: flex; gap: 8px; align-items: center; }
+      .cashier-actions .btn-outline { display: inline-flex; align-items: center; gap: 6px; }
+      .cashier-note { font-size: 11px; color: var(--text-muted); margin: 0; line-height: 1.5; text-align: center; }
+      .cashier-spin { animation: cashier-rotate 1s linear infinite; color: var(--text-muted); }
+      @keyframes cashier-rotate { to { transform: rotate(360deg); } }
+      .balance-actions { display: flex; gap: 8px; margin-top: 12px; }
 
       .tabs { scrollbar-width: none; -webkit-overflow-scrolling: touch; }
       .tabs::-webkit-scrollbar { display: none; }
