@@ -1,15 +1,19 @@
 /**
- * Deriv OAuth + API backend
+ * Deriv OAuth 2.0 + PKCE backend (newer OAuth/API architecture)
  * ---------------------------------------------------
  * Flow:
- *  1. Frontend links user to Deriv's OAuth authorize URL.
- *  2. User logs in on deriv.com, approves the app.
- *  3. Deriv redirects to /auth/callback with acct/token params in the query string.
- *  4. We parse those, store them server-side against a session id,
- *     and redirect the user back to the frontend with just that session id
- *     (never put raw tokens in a URL the browser keeps in history/logs).
- *  5. Frontend calls our API with the session id; we use the stored Deriv
- *     token to open a WebSocket to Deriv's API and fetch account info/balance.
+ *  1. Frontend links the user to Deriv's OAuth2 authorize URL (PKCE).
+ *  2. User logs in on auth.deriv.com, approves the app.
+ *  3. Deriv redirects to /auth/callback with a one-time `code` (+ `state`).
+ *  4. We exchange the code for an OAuth2 access token, store it server-side
+ *     against a session id, and redirect the user back to the frontend with
+ *     just that session id (never put raw tokens in a URL the browser keeps
+ *     in history/logs).
+ *  5. The frontend calls our API with the session id. We use the access
+ *     token against Deriv's REST API (api.derivws.com/trading/v1) to list
+ *     accounts and request per-account OTP WebSocket URLs; real-time trading
+ *     (balance, contracts, streams) runs over those OTP-authenticated
+ *     WebSocket connections — no legacy `authorize` handshake.
  */
 
 import 'dotenv/config'; // loads .env into process.env
@@ -26,7 +30,7 @@ app.use(cors({ origin: process.env.FRONTEND_URL || 'http://localhost:5173', cred
 app.use(express.json());
 
 const PORT = process.env.PORT || 4000;
-const DERIV_APP_ID = process.env.DERIV_APP_ID || '126958'; // used for WebSocket/API calls (Deriv-App-ID header + legacy WS)
+const DERIV_APP_ID = process.env.DERIV_APP_ID || '126958'; // used for REST API calls (Deriv-App-ID header)
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
 
 // DERIV_APP_ID must be the *numeric* app id from Deriv's classic app
@@ -163,10 +167,14 @@ initDb();
 const DERIV_CLIENT_ID = process.env.DERIV_CLIENT_ID || DERIV_APP_ID;
 const DERIV_REDIRECT_URI = process.env.DERIV_REDIRECT_URI || `${'http://localhost:4000'}/auth/callback`;
 const DERIV_SCOPES = process.env.DERIV_SCOPES || 'trade account_manage';
-const DERIV_OAUTH = process.env.DERIV_OAUTH || 'v2'; // 'v2' = OAuth2 + PKCE, 'legacy' = old oauth.deriv.com flow
 
 const DERIV_AUTH_BASE = 'https://auth.deriv.com';
-const DERIV_REST_BASE = 'https://api.derivws.com';
+// Deriv's newer REST API base. Authenticated calls send `Deriv-App-ID` and
+// `Authorization: Bearer <oauth token>` headers; the per-account WebSocket
+// URLs used for real-time trading come from its /otp endpoint.
+const DERIV_REST_BASE = 'https://api.derivws.com/trading/v1';
+// Public (token-less) market-data endpoint: active_symbols, ticks_history, ...
+const DERIV_WS_PUBLIC = `${DERIV_REST_BASE}/options/ws/public`;
 
 const DIST_DIR = path.join(process.cwd(), 'dist');
 
@@ -174,8 +182,7 @@ const DIST_DIR = path.join(process.cwd(), 'dist');
 app.use(express.static(DIST_DIR));
 
 // --- In-memory session store (swap for Redis/DB in production) ---
-// v2 session:  { oauth: 'v2', token, accounts: [{account, token, currency}], createdAt }
-// legacy session: { oauth: 'legacy', accounts: [{account, token, currency}], createdAt }
+// session: { oauth: 'v2', token, accounts: [{account, token, currency}], createdAt }
 const sessions = new Map();
 
 function createSession(data) {
@@ -205,11 +212,6 @@ setInterval(() => {
 // --- Step 1: give the frontend the Deriv OAuth URL to redirect to ---
 app.get('/auth/login-url', (req, res) => {
   const mode = req.query.mode === 'register' ? 'register' : 'login';
-
-  if (DERIV_OAUTH === 'legacy') {
-    const url = `https://oauth.deriv.com/oauth2/authorize?app_id=${DERIV_APP_ID}`;
-    return res.json({ url, mode });
-  }
 
   if (!DERIV_CLIENT_ID || /YOUR_APP_ID/.test(DERIV_CLIENT_ID)) {
     return res.status(500).json({ error: 'DERIV_CLIENT_ID is not configured. Register an app at developers.deriv.com and set DERIV_CLIENT_ID and DERIV_REDIRECT_URI in your .env file.' });
@@ -290,44 +292,20 @@ async function handleOAuth2Callback(query) {
   }
 }
 
-// --- Step 2b: legacy callback (acct1/token1/cur1 params) ---
-function handleLegacyCallback(query) {
-  const accounts = [];
-  let i = 1;
-  while (query[`acct${i}`]) {
-    accounts.push({
-      account: query[`acct${i}`],
-      token: query[`token${i}`],
-      currency: query[`cur${i}`],
-    });
-    i++;
-  }
-
-  if (accounts.length === 0) {
-    return { redirect: `${FRONTEND_URL}/?error=${encodeURIComponent('No accounts returned from Deriv')}` };
-  }
-
-  const sessionId = createSession({ oauth: 'legacy', accounts });
-  return { redirect: `${FRONTEND_URL}/?session=${sessionId}` };
-}
-
 // --- Step 2: Deriv redirects the browser here after login ---
 app.get('/auth/callback', async (req, res) => {
-  const query = req.query;
-
-  if (query.code || query.error) {
-    const outcome = await handleOAuth2Callback(query);
-    return res.redirect(outcome.redirect);
-  }
-
-  res.redirect(handleLegacyCallback(query).redirect);
+  const outcome = await handleOAuth2Callback(req.query);
+  res.redirect(outcome.redirect);
 });
 
-// --- Resolve accounts for a session (v2 sessions have a token, not acct params) ---
+// --- Resolve the accounts for a session (v2 sessions hold an OAuth2 token) ---
+// Uses Deriv's REST API (GET /trading/v1/options/accounts) with the OAuth2
+// access token. The token authorizes every account linked to the Deriv user,
+// so it is attached to each entry for the downstream OTP WebSocket calls
+// (balance, proposal, buy, sell, ...).
 async function accountsFromToken(token) {
-  // New REST API: GET /trading/v1/options/accounts (Bearer token + Deriv-App-ID header)
   try {
-    const restRes = await fetch(`${DERIV_REST_BASE}/trading/v1/options/accounts`, {
+    const restRes = await fetch(`${DERIV_REST_BASE}/options/accounts`, {
       headers: {
         'Deriv-App-ID': DERIV_APP_ID,
         Authorization: `Bearer ${token}`,
@@ -338,11 +316,6 @@ async function accountsFromToken(token) {
       const list = Array.isArray(data)
         ? data
         : (data.accounts || data.data || data.list || []);
-      // The OAuth2 access token authorizes every account linked to this
-      // Deriv user, not just the default one — attach it to every entry so
-      // downstream WS calls (balance, proposal, buy, sell, ...) can
-      // actually authorize instead of silently going out unauthenticated
-      // (which Deriv rejects, surfacing as a 502 on the client).
       const accounts = list
         .map((a) => ({
           account: a.loginid || a.account_id || a.account || a.id,
@@ -352,18 +325,45 @@ async function accountsFromToken(token) {
         .filter((a) => a.account);
       if (accounts.length > 0) return accounts;
     }
-  } catch { /* fall through to legacy WS */ }
-
-  // Legacy WebSocket fallback: authorize with the token and read the current account
-  try {
-    const auth = await authorizeInfo(token);
-    const info = auth.authorize;
-    if (info?.loginid) {
-      return [{ account: info.loginid, currency: info.currency, token }];
-    }
-  } catch { /* no account derivable */ }
+  } catch { /* no accounts derivable */ }
 
   return [];
+}
+
+// --- Request the account-scoped, OTP-authenticated WebSocket URL (REST) ---
+// Every authenticated WebSocket in this app — pooled requests, balance and
+// contract streams — is opened to the URL returned here. The one-time
+// password embedded in it authenticates the socket as `account`, so no
+// `authorize` handshake is needed, and the OAuth2 access_token never has to
+// go near the retired classic `authorize` command.
+async function fetchOtpUrl(token, account) {
+  const res = await fetch(
+    `${DERIV_REST_BASE}/options/accounts/${encodeURIComponent(account)}/otp`,
+    {
+      method: 'POST',
+      headers: {
+        'Deriv-App-ID': DERIV_APP_ID,
+        Authorization: `Bearer ${token}`,
+      },
+    }
+  );
+
+  if (!res.ok) {
+    let message = `Deriv OTP request failed (HTTP ${res.status})`;
+    try {
+      const body = await res.json();
+      const errMsg = body?.errors?.[0]?.message || body?.error;
+      if (errMsg) message = errMsg;
+    } catch { /* non-JSON error body */ }
+    throw Object.assign(new Error(message), { code: `OTP_HTTP_${res.status}` });
+  }
+
+  const data = await res.json();
+  const url = data?.data?.url;
+  if (!url) {
+    throw Object.assign(new Error('Deriv did not return a WebSocket URL for this account'), { code: 'OTP_NO_URL' });
+  }
+  return url;
 }
 
 // --- Step 3: frontend asks for the (non-secret) account list for a session ---
@@ -413,8 +413,9 @@ app.get('/api/balance', async (req, res) => {
 // ---------------------------------------------------------------
 
 // Resolve the token + currency for a specific account in a session.
-// v2 sessions carry a single token (data.token); legacy sessions have a
-// token per account. Returns null if the account is not in the session.
+// OAuth2 sessions carry a single access token (data.token) that is attached
+// to every account entry when the list is resolved. Returns null if the
+// account is not in the session.
 function resolveAccount(data, account) {
   const entry = (data.accounts || []).find((a) => a.account === account)
     || (data.token ? { account: null, token: data.token, currency: undefined } : null);
@@ -574,7 +575,7 @@ app.post('/api/cashier', async (req, res) => {
   }
 
   try {
-    const result = await derivRequest(ctx.acct.token, payload);
+    const result = await derivRequest(ctx.acct.token, payload, { context: { account: ctx.acct.account } });
     const info = result.cashier;
     const url = typeof info === 'string' ? info : (info && (info.url || info.cashier_url)) || null;
     if (!url) {
@@ -597,10 +598,10 @@ app.post('/api/cashier/verify-email', async (req, res) => {
 
   const { type = 'withdraw' } = req.body || {};
   try {
-    const settings = await derivRequest(ctx.acct.token, { get_settings: 1 });
+    const settings = await derivRequest(ctx.acct.token, { get_settings: 1 }, { context: { account: ctx.acct.account } });
     const email = settings.get_settings && settings.get_settings.email;
     if (!email) return res.status(502).json({ error: 'Could not read the account email from Deriv.' });
-    await derivRequest(ctx.acct.token, { verify_email: email, type });
+    await derivRequest(ctx.acct.token, { verify_email: email, type }, { context: { account: ctx.acct.account } });
     res.json({ ok: true, email });
   } catch (err) {
     res.status(502).json({ error: err.message, code: err.code });
@@ -642,21 +643,24 @@ const derivCtx = (request) => Object.keys(request).filter((k) => k !== 'req_id')
 // Deriv rate-limits shared/test app ids (esp. from datacenter IPs like
 // Render) by answering WS upgrades with an HTTP 401 when too many
 // connections arrive in a short burst. Opening a brand-new WebSocket
-// (and, when authenticated, a fresh `authorize` handshake) for every
-// single API call — accounts, balance, contracts_for, proposal, buy —
-// multiplies that risk and is the most common cause of the 502s users
-// see when loading the wallet balance. Instead we keep one connection
-// per Deriv API token (plus one shared connection for public,
-// token-less requests) open for a short idle window and multiplex
-// every request over it using `req_id`, so a page load that fires off
-// several API calls back-to-back reuses a single WS handshake.
+// for every single API call — accounts, balance, contracts_for, proposal,
+// buy — multiplies that risk and is the most common cause of the 502s
+// users see when loading the wallet balance. Instead we keep one
+// connection per (token, account) (plus one shared connection for public,
+// token-less requests) open for a short idle window and multiplex every
+// request over it using `req_id`, so a page load that fires off several
+// API calls back-to-back reuses a single WS handshake.
 const derivPool = new Map(); // key -> pool entry
 let derivReqSeq = 1;
 const DERIV_POOL_IDLE_MS = 30000;
 const DERIV_REQUEST_TIMEOUT_MS = 10000;
 
-function poolKey(token) {
-  return token || '__public__';
+// A pooled connection is scoped to (token, account): the OAuth2 access token
+// authorizes every account linked to the user, but the authenticated
+// WebSocket is fetched per-account from the DerivWS OTP endpoint, so two
+// accounts on the same session never share a socket.
+function poolKey(token, account) {
+  return token ? `${token}:${account || ''}` : '__public__';
 }
 
 // Connection-level failures (bad handshake, timeout, socket error) are
@@ -684,11 +688,9 @@ function touchPoolEntry(entry, key) {
   entry.idleTimer = setTimeout(() => closePoolEntry(key), DERIV_POOL_IDLE_MS);
 }
 
-function openPoolConnection(token, key) {
+async function openPoolConnection(token, account, key) {
   const entry = {
-    ws: new WebSocket(`wss://ws.derivws.com/websockets/v3?app_id=${DERIV_APP_ID}`),
-    authorized: !token,
-    authorizeResult: null,
+    ws: null,
     pending: new Map(),
     idleTimer: null,
     closed: false,
@@ -699,70 +701,73 @@ function openPoolConnection(token, key) {
     entry.readyResolve = resolve;
     entry.readyReject = reject;
   });
-  const { ws } = entry;
+  derivPool.set(key, entry);
 
-  ws.on('open', () => {
-    if (token) ws.send(JSON.stringify({ authorize: token, req_id: 0 }));
-    else entry.readyResolve();
-  });
+  try {
+    // Authenticated connections use Deriv's newer OAuth/API architecture:
+    // request the per-account, OTP-authenticated WebSocket URL from the REST
+    // API and connect to it. The one-time password in the URL authenticates
+    // the socket as `account`, so no `authorize` handshake is needed — and
+    // the OAuth2 access_token would be rejected by the retired classic
+    // `authorize` command anyway. Public (token-less) requests connect to
+    // the shared public market-data endpoint instead.
+    const wsUrl = account
+      ? await fetchOtpUrl(token, account)
+      : DERIV_WS_PUBLIC;
+    const ws = new WebSocket(wsUrl);
+    entry.ws = ws;
 
-  ws.on('message', (msg) => {
-    let response;
-    try { response = JSON.parse(msg); } catch { return; }
+    ws.on('open', () => {
+      entry.readyResolve();
+    });
 
-    if (response.req_id === 0) {
-      // authorize handshake response
+    ws.on('message', (msg) => {
+      let response;
+      try { response = JSON.parse(msg); } catch { return; }
+
+      const waiter = response.req_id != null ? entry.pending.get(response.req_id) : null;
+      if (!waiter) return; // unmatched/unsolicited push — ignore here
+      entry.pending.delete(response.req_id);
       if (response.error) {
         const err = new Error(response.error.message);
         err.code = response.error.code;
         err.details = response.error.details;
-        entry.readyReject(err);
-        closePoolEntry(key, err);
+        waiter.reject(err);
       } else {
-        entry.authorized = true;
-        entry.authorizeResult = response;
-        entry.readyResolve();
+        waiter.resolve(response);
       }
-      return;
-    }
-
-    const waiter = response.req_id != null ? entry.pending.get(response.req_id) : null;
-    if (!waiter) return; // unmatched/unsolicited push — ignore here
-    entry.pending.delete(response.req_id);
-    if (response.error) {
-      const err = new Error(response.error.message);
-      err.code = response.error.code;
-      err.details = response.error.details;
-      waiter.reject(err);
-    } else {
-      waiter.resolve(response);
-    }
-  });
-
-  ws.on('unexpected-response', (req, res) => {
-    readUpgradeBody(res).then((body) => {
-      const err = new Error(`Deriv WS upgrade rejected with HTTP ${res.statusCode}`);
-      err.code = `WS_HTTP_${res.statusCode}`;
-      err.details = body.slice(0, 1000) || null;
-      closePoolEntry(key, err);
     });
-  });
 
-  ws.on('error', (err) => {
-    closePoolEntry(key, Object.assign(new Error(err.message), { code: 'CONNECT' }));
-  });
+    ws.on('unexpected-response', (req, res) => {
+      readUpgradeBody(res).then((body) => {
+        const err = new Error(`Deriv WS upgrade rejected with HTTP ${res.statusCode}`);
+        err.code = `WS_HTTP_${res.statusCode}`;
+        err.details = body.slice(0, 1000) || null;
+        closePoolEntry(key, err);
+      });
+    });
 
-  ws.on('close', () => closePoolEntry(key));
+    ws.on('error', (err) => {
+      closePoolEntry(key, Object.assign(new Error(err.message), { code: 'CONNECT' }));
+    });
 
-  derivPool.set(key, entry);
+    ws.on('close', () => closePoolEntry(key));
+  } catch (err) {
+    derivLog('error', 'CONNECT_FAIL', `could not open Deriv connection: ${err.message}`, {
+      account: account || null,
+      code: err.code || null,
+    });
+    closePoolEntry(key, err);
+  }
+
   return entry;
 }
 
-async function getPoolConnection(token) {
-  const key = poolKey(token);
+async function getPoolConnection(token, account) {
+  const key = poolKey(token, account);
   let entry = derivPool.get(key);
-  if (!entry || entry.closed || entry.ws.readyState > WebSocket.OPEN) {
-    entry = openPoolConnection(token, key);
+  if (!entry || entry.closed || !entry.ws || entry.ws.readyState > WebSocket.OPEN) {
+    entry = await openPoolConnection(token, account, key);
   }
   await entry.ready;
   touchPoolEntry(entry, key);
@@ -791,19 +796,21 @@ function sendPooled(entry, request) {
 }
 
 // --- Send one request over a pooled, reused Deriv WS connection ---
-// Pass a token to authorize first (account data). Pass `null` for public
+// Authenticated requests need a token AND the target account (context.account),
+// which selects the per-account OTP WebSocket URL. Pass `null` for public
 // endpoints (ticks_history, active_symbols) that do not require a token.
 // Connection-level failures are retried with a short backoff and every
 // attempt is logged with the server's rejection body so the underlying
 // reason is visible in the logs (and not just a generic 502 downstream).
 async function derivRequest(token, request, ctx = {}) {
   const { label = derivCtx(request), context = {}, attempts = 3 } = ctx;
+  const account = context.account; // authenticated pool connections are per-account
   const logExtra = { label, ...context };
   let lastErr = null;
 
   for (let attempt = 1; attempt <= attempts; attempt++) {
     try {
-      const entry = await getPoolConnection(token);
+      const entry = await getPoolConnection(token, account);
       const response = await sendPooled(entry, request);
       if (attempt > 1) derivLog('warn', 'RETRIED_OK', 'succeeded after retries', { ...logExtra, attempt });
       return response;
@@ -824,12 +831,6 @@ async function derivRequest(token, request, ctx = {}) {
     }
   }
   throw lastErr;
-}
-
-// --- Authorize a token and return the `authorize` response, reusing the pool ---
-async function authorizeInfo(token, ctx = {}) {
-  const entry = await getPoolConnection(token);
-  return entry.authorizeResult || { authorize: {} };
 }
 
 // Attach diagnostics to the long-lived streams (tick/contract/balance):
@@ -865,7 +866,7 @@ function sessionLoginid(req) {
   if (account) {
     const known = (data.accounts || []).find((a) => a.account === account);
     if (known) return known.account;
-    // v2 single-token sessions before the account list is resolved
+    // OAuth2 single-token sessions before the account list is resolved
     if (data.token && (!data.accounts || data.accounts.length === 0)) return account;
     return null;
   }
@@ -1274,7 +1275,7 @@ function probeAvailableSymbols(candidates) {
     const cleanup = () => { try { ws.close(); } catch { /* noop */ } };
 
     const tryConnect = () => {
-      ws = new WebSocket(DERIV_TICK_WS);
+      ws = new WebSocket(DERIV_WS_PUBLIC);
       const timeout = setTimeout(() => { cleanup(); resolve(valid); }, 20000);
       ws.on('open', () => {
         ws.send(JSON.stringify({ ticks_history: candidates[index][0], count: 1, end: 'latest', granularity: 60, style: 'candles' }));
@@ -1453,7 +1454,6 @@ app.get('/api/candles', async (req, res) => {
 // user instead of silently showing a dead chart.
 // ---------------------------------------------------------------
 
-const DERIV_TICK_WS = `wss://ws.derivws.com/websockets/v3?app_id=${DERIV_APP_ID}`;
 const tickStreams = new Map(); // symbol -> stream object
 
 let tickPollReqSeq = 1;
@@ -1566,7 +1566,7 @@ function getTickStream(symbol) {
 
   const connect = () => {
     if (stream.ws) { try { stream.ws.close(); } catch { /* noop */ } stream.ws = null; }
-    stream.ws = new WebSocket(DERIV_TICK_WS);
+    stream.ws = new WebSocket(DERIV_WS_PUBLIC);
     attachStreamDiag(stream.ws, 'tick', { symbol });
     stream.ws.on('open', () => {
       stream.retry = 0;
@@ -1690,10 +1690,10 @@ function releaseTickStream(symbol, client) {
 // the entry point and run the expiry countdown live.
 // ---------------------------------------------------------------
 
-const contractStreams = new Map(); // `token:contract_id` -> { ws, clients: Set, retry }
+const contractStreams = new Map(); // `token:account:contract_id` -> { ws, clients: Set, retry }
 
-function getContractStream(token, contractId) {
-  const key = `${token}:${contractId}`;
+function getContractStream(token, account, contractId) {
+  const key = `${token}:${account}:${contractId}`;
   let stream = contractStreams.get(key);
   if (stream) return stream;
 
@@ -1701,41 +1701,52 @@ function getContractStream(token, contractId) {
   contractStreams.set(key, stream);
 
   const connect = () => {
-    stream.ws = new WebSocket(DERIV_TICK_WS);
-    attachStreamDiag(stream.ws, 'contract', { contractId });
-    stream.ws.on('open', () => {
-      stream.retry = 0;
-      stream.ws.send(JSON.stringify({ authorize: token }));
-    });
-    stream.ws.on('message', (msg) => {
-      let parsed;
-      try { parsed = JSON.parse(msg); } catch { return; }
-      if (parsed.msg_type === 'authorize') {
-        stream.ws.send(JSON.stringify({ proposal_open_contract: 1, subscribe: 1, contract_id: contractId }));
-      } else if (parsed.msg_type === 'proposal_open_contract') {
-        const payload = JSON.stringify(parsed);
-        for (const client of [...stream.clients]) {
-          if (client.readyState === client.OPEN) client.send(payload);
+    fetchOtpUrl(token, account)
+      .then((url) => {
+        const ws = new WebSocket(url);
+        stream.ws = ws;
+        attachStreamDiag(ws, 'contract', { contractId, account });
+        ws.on('open', () => {
+          stream.retry = 0;
+          ws.send(JSON.stringify({ proposal_open_contract: 1, subscribe: 1, contract_id: contractId }));
+        });
+        ws.on('message', (msg) => {
+          let parsed;
+          try { parsed = JSON.parse(msg); } catch { return; }
+          if (parsed.msg_type === 'proposal_open_contract') {
+            const payload = JSON.stringify(parsed);
+            for (const client of [...stream.clients]) {
+              if (client.readyState === client.OPEN) client.send(payload);
+            }
+          }
+        });
+        ws.on('close', () => {
+          stream.ws = null;
+          contractStreams.delete(key);
+          if (stream.clients.size > 0) {
+            const delay = Math.min(1000 * 2 ** stream.retry, 30000);
+            stream.retry += 1;
+            setTimeout(connect, delay);
+          }
+        });
+        ws.on('error', () => { /* close handler owns reconnect */ });
+      })
+      .catch(() => {
+        contractStreams.delete(key);
+        if (stream.clients.size > 0) {
+          const delay = Math.min(1000 * 2 ** stream.retry, 30000);
+          stream.retry += 1;
+          setTimeout(connect, delay);
         }
-      }
-    });
-    stream.ws.on('close', () => {
-      contractStreams.delete(key);
-      if (stream.clients.size > 0) {
-        const delay = Math.min(1000 * 2 ** stream.retry, 30000);
-        stream.retry += 1;
-        setTimeout(connect, delay);
-      }
-    });
-    stream.ws.on('error', () => { /* close handler owns reconnect */ });
+      });
   };
 
   connect();
   return stream;
 }
 
-function releaseContractStream(token, contractId, client) {
-  const key = `${token}:${contractId}`;
+function releaseContractStream(token, account, contractId, client) {
+  const key = `${token}:${account}:${contractId}`;
   const stream = contractStreams.get(key);
   if (!stream) return;
   stream.clients.delete(client);
@@ -1746,67 +1757,81 @@ function releaseContractStream(token, contractId, client) {
 }
 
 // ---------------------------------------------------------------
-// Live balance stream: one authenticated Deriv WS per token,
-// subscribed to `balance` (subscribe: 1) so any account change
-// (buy, sell, win, cashier deposit/withdraw) is pushed to the
-// browser automatically — matching Deriv's real-time balance.
+// Live balance stream: one OTP-authenticated Deriv WS per
+// (token, account), subscribed to `balance` (subscribe: 1) so any
+// account change (buy, sell, win, cashier deposit/withdraw) is
+// pushed to the browser automatically — matching Deriv's real-time
+// balance.
 // ---------------------------------------------------------------
 
-const balanceStreams = new Map(); // token -> { ws, clients: Set, retry }
+const balanceStreams = new Map(); // `token:account` -> { ws, clients: Set, retry }
 
-function getBalanceStream(token) {
-  let stream = balanceStreams.get(token);
+function getBalanceStream(token, account) {
+  const key = `${token}:${account}`;
+  let stream = balanceStreams.get(key);
   if (stream) return stream;
 
   stream = { ws: null, clients: new Set(), retry: 0 };
-  balanceStreams.set(token, stream);
+  balanceStreams.set(key, stream);
 
   const connect = () => {
-    stream.ws = new WebSocket(DERIV_TICK_WS);
-    attachStreamDiag(stream.ws, 'balance', {});
-    stream.ws.on('open', () => {
-      stream.retry = 0;
-      stream.ws.send(JSON.stringify({ authorize: token }));
-    });
-    stream.ws.on('message', (msg) => {
-      let parsed;
-      try { parsed = JSON.parse(msg); } catch { return; }
-      if (parsed.msg_type === 'authorize') {
-        stream.ws.send(JSON.stringify({ balance: 1, subscribe: 1 }));
-      } else if (parsed.msg_type === 'balance') {
-        const payload = JSON.stringify({ msg_type: 'balance', balance: parsed.balance });
-        for (const client of [...stream.clients]) {
-          if (client.readyState === client.OPEN) client.send(payload);
+    fetchOtpUrl(token, account)
+      .then((url) => {
+        const ws = new WebSocket(url);
+        stream.ws = ws;
+        attachStreamDiag(ws, 'balance', { account });
+        ws.on('open', () => {
+          stream.retry = 0;
+          ws.send(JSON.stringify({ balance: 1, subscribe: 1 }));
+        });
+        ws.on('message', (msg) => {
+          let parsed;
+          try { parsed = JSON.parse(msg); } catch { return; }
+          if (parsed.msg_type === 'balance') {
+            const payload = JSON.stringify({ msg_type: 'balance', balance: parsed.balance });
+            for (const client of [...stream.clients]) {
+              if (client.readyState === client.OPEN) client.send(payload);
+            }
+          } else if (parsed.msg_type === 'error') {
+            const payload = JSON.stringify({ msg_type: 'balance_error', error: parsed.error });
+            for (const client of [...stream.clients]) {
+              if (client.readyState === client.OPEN) client.send(payload);
+            }
+          }
+        });
+        ws.on('close', () => {
+          stream.ws = null;
+          balanceStreams.delete(key);
+          if (stream.clients.size > 0) {
+            const delay = Math.min(1000 * 2 ** stream.retry, 30000);
+            stream.retry += 1;
+            setTimeout(connect, delay);
+          }
+        });
+        ws.on('error', () => { /* close handler owns reconnect */ });
+      })
+      .catch(() => {
+        balanceStreams.delete(key);
+        if (stream.clients.size > 0) {
+          const delay = Math.min(1000 * 2 ** stream.retry, 30000);
+          stream.retry += 1;
+          setTimeout(connect, delay);
         }
-      } else if (parsed.msg_type === 'error') {
-        const payload = JSON.stringify({ msg_type: 'balance_error', error: parsed.error });
-        for (const client of [...stream.clients]) {
-          if (client.readyState === client.OPEN) client.send(payload);
-        }
-      }
-    });
-    stream.ws.on('close', () => {
-      balanceStreams.delete(token);
-      if (stream.clients.size > 0) {
-        const delay = Math.min(1000 * 2 ** stream.retry, 30000);
-        stream.retry += 1;
-        setTimeout(connect, delay);
-      }
-    });
-    stream.ws.on('error', () => { /* close handler owns reconnect */ });
+      });
   };
 
   connect();
   return stream;
 }
 
-function releaseBalanceStream(token, client) {
-  const stream = balanceStreams.get(token);
+function releaseBalanceStream(token, account, client) {
+  const key = `${token}:${account}`;
+  const stream = balanceStreams.get(key);
   if (!stream) return;
   stream.clients.delete(client);
   if (stream.clients.size === 0 && stream.ws) {
     stream.ws.close();
-    balanceStreams.delete(token);
+    balanceStreams.delete(key);
   }
 }
 
@@ -1839,8 +1864,9 @@ wss.on('connection', (ws, req) => {
   const acctData = sessionData ? resolveAccount(sessionData, account) : null;
 
   ws._symbols = new Set();
-  ws._contracts = new Set(); // token:contract_id keys
+  ws._contracts = new Set(); // `token:account:contract_id` keys
   let balanceToken = null;   // token for the live balance subscription
+  let balanceAccount = null; // account for the live balance subscription
 
   const subscribeSymbol = (symbol, granularity) => {
     if (!symbol || ws._symbols.has(symbol)) return;
@@ -1854,25 +1880,27 @@ wss.on('connection', (ws, req) => {
   };
   const subscribeContract = (contractId) => {
     if (!contractId || !acctData) return;
-    const key = `${acctData.token}:${contractId}`;
+    const key = `${acctData.token}:${acctData.account}:${contractId}`;
     if (ws._contracts.has(key)) return;
     ws._contracts.add(key);
-    getContractStream(acctData.token, contractId).clients.add(ws);
+    getContractStream(acctData.token, acctData.account, contractId).clients.add(ws);
   };
   const unsubscribeContract = (contractId) => {
     if (!contractId || !acctData) return;
-    const key = `${acctData.token}:${contractId}`;
-    if (ws._contracts.delete(key)) releaseContractStream(acctData.token, contractId, ws);
+    const key = `${acctData.token}:${acctData.account}:${contractId}`;
+    if (ws._contracts.delete(key)) releaseContractStream(acctData.token, acctData.account, contractId, ws);
   };
   const subscribeBalance = () => {
     if (!acctData || balanceToken) return;
     balanceToken = acctData.token;
-    getBalanceStream(acctData.token).clients.add(ws);
+    balanceAccount = acctData.account;
+    getBalanceStream(acctData.token, acctData.account).clients.add(ws);
   };
   const unsubscribeBalance = () => {
     if (!balanceToken) return;
-    releaseBalanceStream(balanceToken, ws);
+    releaseBalanceStream(balanceToken, balanceAccount, ws);
     balanceToken = null;
+    balanceAccount = null;
   };
 
   if (initialSymbol) subscribeSymbol(initialSymbol, initialGranularity);
@@ -1911,10 +1939,10 @@ wss.on('connection', (ws, req) => {
   ws.on('close', () => {
     for (const symbol of ws._symbols) releaseTickStream(symbol, ws);
     for (const key of ws._contracts) {
-      const sep = key.indexOf(':');
-      releaseContractStream(key.slice(0, sep), key.slice(sep + 1), ws);
+      const [token, account, contractId] = key.split(':');
+      releaseContractStream(token, account, contractId, ws);
     }
-    if (balanceToken) releaseBalanceStream(balanceToken, ws);
+    if (balanceToken) releaseBalanceStream(balanceToken, balanceAccount, ws);
   });
 });
 
