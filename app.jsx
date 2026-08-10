@@ -2,12 +2,11 @@ import { useEffect, useRef, useState, useMemo } from 'react';
 import {
   Play, LayoutGrid, Wrench, LineChart as ChartIcon, Users, Gift,
   Brain, Copy as CopyIcon, User, X, RotateCcw, TrendingUp, TrendingDown,
-  GraduationCap, CandlestickChart, Calculator, BookOpen, Radio, Activity,
+  GraduationCap, Calculator, BookOpen, Radio, Activity,
   RefreshCw, AlertTriangle, Moon, Sun, Monitor, Wallet,
 } from 'lucide-react';
 import { createChart, AreaSeries, CandlestickSeries, ColorType, CrosshairMode, LineStyle, createSeriesMarkers } from 'lightweight-charts';
 import ClassesTab from './tabs/classes.jsx';
-import TradingViewTab from './tabs/tradingview.jsx';
 import BotBuilderTab from './tabs/botbuilder.jsx';
 import RiskCalculatorTab from './tabs/risk.jsx';
 import TutorialsTab from './tabs/tutorials.jsx';
@@ -31,7 +30,6 @@ async function readApiError(r) {
 const BRAND = 'PronoFX Dbot';
 
 const TABS = [
-  { id: 'campaigns', label: 'Campaigns', icon: Play },
   { id: 'dashboard', label: 'Dashboard', icon: LayoutGrid },
   { id: 'builder', label: 'Bot Builder', icon: Wrench },
   { id: 'charts', label: 'Charts', icon: ChartIcon },
@@ -41,7 +39,6 @@ const TABS = [
   { id: 'copytrading', label: 'Copytrading', icon: CopyIcon },
   { id: 'manual', label: 'Manual Trader', icon: User },
   { id: 'classes', label: 'Classes', icon: GraduationCap },
-  { id: 'tradingview', label: 'Trading View', icon: CandlestickChart },
   { id: 'riskcalc', label: 'Risk Calculator', icon: Calculator },
   { id: 'tutorials', label: 'Tutorials', icon: BookOpen },
 ];
@@ -74,7 +71,7 @@ const PROMOS = [
 ];
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState('campaigns');
+  const [activeTab, setActiveTab] = useState('dashboard');
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [sidebarTab, setSidebarTab] = useState('summary');
   const [authModal, setAuthModal] = useState(false);
@@ -269,7 +266,6 @@ export default function App() {
 
       <div className="body">
         <main className="main">
-          {activeTab === 'campaigns' && <CampaignsTab />}
           {activeTab === 'dashboard' && (
             <DashboardTab
               loggedIn={!!sessionId}
@@ -351,7 +347,6 @@ export default function App() {
             />
           )}
           {activeTab === 'classes' && <ClassesTab />}
-          {activeTab === 'tradingview' && <TradingViewTab theme={theme} />}
           {activeTab === 'riskcalc' && <RiskCalculatorTab />}
           {activeTab === 'tutorials' && <TutorialsTab />}
         </main>
@@ -855,6 +850,10 @@ function DashboardTab({ loggedIn, sessionId, accounts, selectedAccount, setSelec
           </div>
         </>
       )}
+
+      <div style={{ marginTop: 28 }}>
+        <CampaignsTab />
+      </div>
     </div>
   );
 }
