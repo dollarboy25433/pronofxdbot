@@ -27,7 +27,9 @@ import pg from 'pg';
 
 const app = express();
 app.use(cors({ origin: process.env.FRONTEND_URL || 'http://localhost:5173', credentials: true }));
-app.use(express.json());
+// 12mb so base64 banner images can reach /api/upload before being handed
+// off to Cloudinary (the DB only ever stores the resulting small URLs).
+app.use(express.json({ limit: '12mb' }));
 
 const PORT = process.env.PORT || 4000;
 const DERIV_APP_ID = process.env.DERIV_APP_ID || '126958'; // used for REST API calls (Deriv-App-ID header)
@@ -1168,37 +1170,103 @@ app.delete('/api/copy/strategies/:id', async (req, res) => {
 // the server. Add GEMINI_API_KEY to .env to enable.
 // ---------------------------------------------------------------
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.0-flash';
+// Primary model + fallbacks, tried in order when one returns a quota
+// (429) or transient 5xx. GEMINI_MODEL can be a single model or a
+// comma-separated chain, e.g. GEMINI_MODEL="gemini-2.5-flash,gemini-2.0-flash".
+const GEMINI_MODELS = (process.env.GEMINI_MODEL || 'gemini-2.0-flash')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+if (GEMINI_MODELS.length === 0) GEMINI_MODELS.push('gemini-2.0-flash');
 
 app.get('/api/ai/status', (req, res) => {
-  res.json({ configured: !!GEMINI_API_KEY, model: GEMINI_MODEL });
+  res.json({ configured: !!GEMINI_API_KEY, model: GEMINI_MODELS[0], models: GEMINI_MODELS });
 });
 
 app.post('/api/ai', async (req, res) => {
   if (!GEMINI_API_KEY) return res.status(503).json({ error: 'AI is not configured — add GEMINI_API_KEY to the server env.' });
   const { prompt, context, temperature = 0.7 } = req.body || {};
   if (!prompt || !String(prompt).trim()) return res.status(400).json({ error: 'Missing prompt' });
-  try {
-    const systemInstruction = context || 'You are an expert trading assistant for a Deriv binary-options bot called PronoFX Dbot. Be concise, practical and honest about risk. You can reference synthetic indices, forex and crypto symbols. Never promise guaranteed profits.';
-    const body = {
-      system_instruction: { parts: [{ text: systemInstruction }] },
-      contents: [{ role: 'user', parts: [{ text: String(prompt).slice(0, 4000) }] }],
-      generationConfig: { temperature: Math.min(Math.max(temperature, 0), 1) },
-    };
-    const resp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    if (!resp.ok) {
-      const errText = await resp.text();
-      return res.status(resp.status).json({ error: `Gemini API error (${resp.status}): ${errText.slice(0, 200)}` });
+  const systemInstruction = context || 'You are an expert trading assistant for a Deriv binary-options bot called PronoFX Dbot. Be concise, practical and honest about risk. You can reference synthetic indices, forex and crypto symbols. Never promise guaranteed profits.';
+  const body = {
+    system_instruction: { parts: [{ text: systemInstruction }] },
+    contents: [{ role: 'user', parts: [{ text: String(prompt).slice(0, 4000) }] }],
+    generationConfig: { temperature: Math.min(Math.max(temperature, 0), 1) },
+  };
+
+  let lastErr = 'Gemini request failed';
+  for (const model of GEMINI_MODELS) {
+    try {
+      const resp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (!resp.ok) {
+        const errText = await resp.text();
+        lastErr = `Gemini API error (${resp.status}) on ${model}: ${errText.slice(0, 200)}`;
+        // No point trying another model for an invalid API key/auth failure.
+        if (resp.status === 400 || resp.status === 401 || resp.status === 403) break;
+        await new Promise((r) => setTimeout(r, 700));
+        continue;
+      }
+      const data = await resp.json();
+      const text = data.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('') || '';
+      return res.json({ text, model });
+    } catch (e) {
+      lastErr = `Gemini request failed on ${model}: ${e.message}`;
+      await new Promise((r) => setTimeout(r, 700));
     }
-    const data = await resp.json();
-    const text = data.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('') || '';
-    res.json({ text });
+  }
+  res.status(500).json({ error: lastErr });
+});
+
+// ---------------------------------------------------------------
+// Image uploads (Cloudinary)
+// Banner pickers read images as base64 data URLs; this endpoint hands
+// them to Cloudinary and returns the hosted URL, so the database only
+// stores small URLs (no PayloadTooLarge errors, no giant DB rows).
+// Set CLOUDINARY_URL (cloudinary://API_KEY:API_SECRET@CLOUD_NAME) in
+// .env to enable. Without it the data URL is echoed back so community
+// uploads still work locally in development.
+// ---------------------------------------------------------------
+const CLOUDINARY_PARTS = (process.env.CLOUDINARY_URL || '')
+  .match(/^cloudinary:\/\/([^:]+):([^@]+)@(.+)$/);
+
+function uploadToCloudinary(dataUrl) {
+  if (!CLOUDINARY_PARTS) return Promise.reject(new Error('CLOUDINARY_URL is not configured'));
+  const [, api_key, api_secret, cloud_name] = CLOUDINARY_PARTS;
+  const timestamp = Math.floor(Date.now() / 1000);
+  const signature = crypto.createHash('sha1').update(`timestamp=${timestamp}${api_secret}`).digest('hex');
+  const form = new FormData();
+  form.append('file', dataUrl);
+  form.append('api_key', api_key);
+  form.append('timestamp', String(timestamp));
+  form.append('signature', signature);
+  return fetch(`https://api.cloudinary.com/v1_1/${cloud_name}/image/upload`, { method: 'POST', body: form })
+    .then(async (r) => {
+      const body = await r.json();
+      if (!r.ok) throw new Error(body.error?.message || `Cloudinary HTTP ${r.status}`);
+      return body.secure_url || body.url;
+    });
+}
+
+app.post('/api/upload', async (req, res) => {
+  const loginid = sessionLoginid(req);
+  if (!loginid) return res.status(401).json({ error: 'Not authenticated' });
+  const { data } = req.body || {};
+  if (!data || typeof data !== 'string') return res.status(400).json({ error: 'Missing image data' });
+  const m = /^data:(image\/[a-z0-9.+-]+);base64,([A-Za-z0-9+/=]+)$/.exec(data);
+  if (!m) return res.status(400).json({ error: 'Image must be a base64 data URL' });
+  const raw = Buffer.from(m[2], 'base64');
+  if (!raw.length) return res.status(400).json({ error: 'Empty image data' });
+  if (raw.length > 800 * 1024) return res.status(400).json({ error: 'Image too large (max 800 KB)' });
+  if (!CLOUDINARY_PARTS) return res.json({ url: data }); // dev fallback
+  try {
+    const url = await uploadToCloudinary(data);
+    res.json({ url });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    res.status(502).json({ error: e.message });
   }
 });
 

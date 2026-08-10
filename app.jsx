@@ -1085,27 +1085,56 @@ function ChartsTab({ theme }) {
 }
 
 // Banner image upload helper for community cards (circles, bots, strategies).
-function BannerPicker({ banner, onChange }) {
+// The image is uploaded to the server (Cloudinary) and the resulting URL is
+// stored, so create/update payloads stay small instead of shipping base64.
+function BannerPicker({ banner, onChange, session, account }) {
   const ref = useRef(null);
+  const [uploading, setUploading] = useState(false);
+  const [uploadError, setUploadError] = useState(null);
+
+  function uploadBanner(data) {
+    setUploading(true);
+    setUploadError(null);
+    if (!session || !account) {
+      onChange(data);
+      setUploading(false);
+      return;
+    }
+    fetch(`${API_BASE}/api/upload`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session, account, data }),
+    })
+      .then(async (r) => {
+        const d = await r.json();
+        if (d.url) onChange(d.url);
+        else setUploadError(d.error || 'Upload failed.');
+      })
+      .catch((e) => setUploadError(e.message))
+      .finally(() => setUploading(false));
+  }
+
   function pick(e) {
     const file = e.target.files && e.target.files[0];
     if (!file) return;
-    if (file.size > 800 * 1024) { e.target.value = ''; return; }
+    if (file.size > 800 * 1024) { e.target.value = ''; setUploadError('Image must be under 800 KB.'); return; }
     const reader = new FileReader();
-    reader.onload = () => onChange(String(reader.result || ''));
+    reader.onload = () => uploadBanner(String(reader.result || ''));
     reader.readAsDataURL(file);
     e.target.value = '';
   }
+
   return (
     <div className="banner-picker">
       {banner ? <img src={banner} alt="" className="banner-preview" /> : <div className="banner-preview banner-preview-empty">No banner</div>}
       <div className="banner-actions">
-        <button type="button" className="btn-outline btn-small" onClick={() => ref.current && ref.current.click()}>
-          {banner ? 'Change banner' : '+ Upload banner'}
+        <button type="button" className="btn-outline btn-small" onClick={() => ref.current && ref.current.click()} disabled={uploading}>
+          {uploading ? 'Uploading…' : (banner ? 'Change banner' : '+ Upload banner')}
         </button>
         {banner && <button type="button" className="btn-outline btn-small" onClick={() => onChange('')}>Remove</button>}
       </div>
       <input ref={ref} type="file" accept="image/*" style={{ display: 'none' }} onChange={pick} />
+      {uploadError && <div className="mt-error">{uploadError}</div>}
     </div>
   );
 }
@@ -1223,7 +1252,7 @@ function CirclesTab({ sessionId, selectedAccount, onRequireAuth, onActivity }) {
           </div>
           <div className="booking-field">
             <span>Banner image</span>
-            <BannerPicker banner={banner} onChange={setBanner} />
+            <BannerPicker banner={banner} onChange={setBanner} session={sessionId} account={selectedAccount} />
           </div>
           <button className="btn-primary booking-submit" type="submit">Create circle</button>
         </form>
@@ -1395,7 +1424,7 @@ function FreeBotsTab({ sessionId, selectedAccount, onRequireAuth, onUseBot, onAc
           </div>
           <div className="booking-field">
             <span>Banner image</span>
-            <BannerPicker banner={banner} onChange={setBanner} />
+            <BannerPicker banner={banner} onChange={setBanner} session={sessionId} account={selectedAccount} />
           </div>
           <div className="booking-field">
             <span>Strategy content (export it from the Bot Builder with "Export", or paste a Deriv DBot .xml file)</span>
@@ -1450,6 +1479,8 @@ function AIHubTab({ onActivity }) {
   const [count, setCount] = useState(120);
   const [verdict, setVerdict] = useState(null);
   const [verdictBusy, setVerdictBusy] = useState(false);
+  const [liveTicks, setLiveTicks] = useState([]);
+  const [liveStatus, setLiveStatus] = useState('offline');
 
   useEffect(() => {
     fetch(`${API_BASE}/api/ai/status`)
@@ -1461,6 +1492,58 @@ function AIHubTab({ onActivity }) {
       .then((d) => setSymbols(d.symbols || []))
       .catch(() => {});
   }, []);
+
+  // Live tick feed for the selected symbol — analysis prompts overlay REST
+  // candle history with the freshest live ticks so decisions use real data.
+  useEffect(() => {
+    let ws = null;
+    let closed = false;
+    let retryTimer = null;
+    let retry = 0;
+    setLiveTicks([]);
+    setLiveStatus('connecting');
+
+    const connect = () => {
+      if (closed) return;
+      setLiveStatus('connecting');
+      let socket;
+      try {
+        socket = new WebSocket(`${WS_BASE}/ws?symbol=${encodeURIComponent(symbol)}`);
+      } catch {
+        setLiveStatus('offline');
+        retryTimer = setTimeout(connect, 3000);
+        return;
+      }
+      ws = socket;
+      socket.onopen = () => { retry = 0; setLiveStatus('live'); };
+      socket.onmessage = (e) => {
+        try {
+          const msg = JSON.parse(e.data);
+          if (msg.msg_type !== 'tick' || !msg.tick) return;
+          const { epoch, quote } = msg.tick;
+          setLiveTicks((prev) => {
+            if (prev.length && prev[prev.length - 1].t >= epoch) return prev;
+            const next = [...prev, { t: epoch, price: quote }];
+            return next.length > 600 ? next.slice(next.length - 600) : next;
+          });
+        } catch { /* ignore malformed frames */ }
+      };
+      socket.onclose = () => {
+        if (closed) return;
+        setLiveStatus('offline');
+        retryTimer = setTimeout(connect, Math.min(1000 * 2 ** retry, 15000));
+        retry += 1;
+      };
+      socket.onerror = () => { try { socket.close(); } catch { /* noop */ } };
+    };
+
+    connect();
+    return () => {
+      closed = true;
+      clearTimeout(retryTimer);
+      try { if (ws) ws.close(); } catch { /* noop */ }
+    };
+  }, [symbol]);
 
   function callAI(prompt, context, temperature) {
     return fetch(`${API_BASE}/api/ai`, {
@@ -1492,37 +1575,48 @@ function AIHubTab({ onActivity }) {
       .finally(() => setBusy(false));
   }
 
-  function analyze(kind) {
+  async function analyze(kind) {
     if (verdictBusy) return;
     setVerdictBusy(true);
     setError(null);
     setVerdict(null);
-    fetch(`${API_BASE}/api/candles?symbol=${encodeURIComponent(symbol)}&granularity=${timeframe}&count=${count}`)
-      .then(async (r) => (r.ok ? r.json() : Promise.reject(new Error(await readApiError(r)))))
-      .then((cd) => {
-        const candles = cd.candles || [];
-        if (candles.length < 20) throw new Error('Not enough candle data for this symbol.');
-        const last = candles[candles.length - 1].c;
-        const lows = candles.map((c) => c.l);
-        const highs = candles.map((c) => c.h);
-        const low = Math.min(...lows);
-        const high = Math.max(...highs);
-        const range = (((high - low) / (low || 1)) * 100).toFixed(2);
-        const recent = candles.slice(-40).map((c) => `${new Date(c.t).toLocaleString()}  O${c.o} H${c.h} L${c.l} C${c.c}`).join('\n');
-        const prompt = kind === 'sentiment'
-          ? `Symbol ${symbol}, last ${candles.length} candles (granularity ${timeframe}s). Last close ~${last}, 40-candle range ${range}%.\nCandles:\n${recent}\n\nGive a short sentiment read: bullish / bearish / neutral with 2-3 reasons and a suggested bias for a short binary option contract.`
-          : `Symbol ${symbol}, last ${candles.length} candles (granularity ${timeframe}s). Last close ~${last}, 40-candle range ${range}%.\nCandles:\n${recent}\n\nFlag any anomalies: unusual volatility spikes, sudden gaps, or regime changes. List each one on its own line with a severity (low / med / high). If none stand out, say so clearly.`;
-        const context = kind === 'sentiment'
-          ? 'You are a market analyst for Deriv synthetic indices. Be objective, note uncertainty, never promise profits.'
-          : 'You are a volatility analyst for binary options trading on Deriv synthetic indices. Be precise and data-driven.';
-        return callAI(prompt, context, kind === 'sentiment' ? 0.5 : 0.4);
-      })
-      .then((text) => {
-        setVerdict({ kind, text });
-        if (onActivity) onActivity(kind === 'sentiment' ? 'ai_sentiment' : 'ai_anomaly', { symbol });
-      })
-      .catch((e2) => setError(e2.message))
-      .finally(() => setVerdictBusy(false));
+    try {
+      const cd = await fetch(`${API_BASE}/api/candles?symbol=${encodeURIComponent(symbol)}&granularity=${timeframe}&count=${count}`)
+        .then(async (r) => (r.ok ? r.json() : Promise.reject(new Error(await readApiError(r)))));
+      const history = cd.candles || [];
+
+      // Overlay the live tick feed (aggregated to the chosen timeframe) on
+      // top of the history so the freshest price action is included.
+      const liveCandles = aggregateCandles(liveTicks, Number(timeframe));
+      const lastHist = history.length ? history[history.length - 1].t : 0;
+      const liveNew = liveCandles.filter((c) => c.t > lastHist);
+      const candles = [...history, ...liveNew];
+
+      if (candles.length < 20) throw new Error('Not enough candle data for this symbol.');
+      const last = candles[candles.length - 1].c;
+      const lows = candles.map((c) => c.l);
+      const highs = candles.map((c) => c.h);
+      const low = Math.min(...lows);
+      const high = Math.max(...highs);
+      const range = (((high - low) / (low || 1)) * 100).toFixed(2);
+      const recent = candles.slice(-40).map((c) => `${new Date(c.t).toLocaleString()}  O${c.o} H${c.h} L${c.l} C${c.c}`).join('\n');
+      const liveNote = liveNew.length
+        ? ` and the last ${liveNew.length} candle(s) come from the live tick feed`
+        : (liveStatus === 'live' ? ' (live feed connected, no new candle yet)' : ' (live feed offline — history only)');
+      const prompt = kind === 'sentiment'
+        ? `Symbol ${symbol}, last ${candles.length} candles (granularity ${timeframe}s)${liveNote}. Last close ~${last}, 40-candle range ${range}%.\nCandles:\n${recent}\n\nGive a short sentiment read: bullish / bearish / neutral with 2-3 reasons and a suggested bias for a short binary option contract.`
+        : `Symbol ${symbol}, last ${candles.length} candles (granularity ${timeframe}s)${liveNote}. Last close ~${last}, 40-candle range ${range}%.\nCandles:\n${recent}\n\nFlag any anomalies: unusual volatility spikes, sudden gaps, or regime changes. List each one on its own line with a severity (low / med / high). If none stand out, say so clearly.`;
+      const context = kind === 'sentiment'
+        ? 'You are a market analyst for Deriv synthetic indices. Be objective, note uncertainty, never promise profits.'
+        : 'You are a volatility analyst for binary options trading on Deriv synthetic indices. Be precise and data-driven.';
+      const text = await callAI(prompt, context, kind === 'sentiment' ? 0.5 : 0.4);
+      setVerdict({ kind, text });
+      if (onActivity) onActivity(kind === 'sentiment' ? 'ai_sentiment' : 'ai_anomaly', { symbol });
+    } catch (e2) {
+      setError(e2.message);
+    } finally {
+      setVerdictBusy(false);
+    }
   }
 
   const modeBtn = (id, label) => (
@@ -1565,6 +1659,12 @@ function AIHubTab({ onActivity }) {
 
       {(mode === 'sentiment' || mode === 'anomaly') && (
         <div className="booking-card community-form">
+          <div className="booking-row" style={{ justifyContent: 'space-between', marginBottom: 4 }}>
+            <span className="mt-hint">Analysis overlays REST candle history with the live tick feed for {symbol}.</span>
+            <span className={`tv-status ${liveStatus === 'live' ? 'tv-live' : liveStatus === 'connecting' ? 'tv-connecting' : 'tv-offline'}`}>
+              <Radio size={13} /> {liveStatus === 'live' ? 'Live' : liveStatus === 'connecting' ? 'Connecting' : 'Offline'}
+            </span>
+          </div>
           <div className="booking-row">
             <div className="booking-field">
               <span>Symbol</span>
@@ -1794,7 +1894,7 @@ function CopytradingTab({ sessionId, selectedAccount, accounts, currency, onRequ
           </div>
           <div className="booking-field">
             <span>Banner image</span>
-            <BannerPicker banner={banner} onChange={setBanner} />
+            <BannerPicker banner={banner} onChange={setBanner} session={sessionId} account={selectedAccount} />
           </div>
           <div className="booking-row">
             <div className="booking-field">
@@ -3414,12 +3514,27 @@ function GlobalStyle() {
       .builder-add { border: 1px dashed var(--border); background: transparent; color: var(--text-muted); border-radius: 10px; padding: 12px; font-size: 13px; cursor: pointer; }
       .builder-add:hover { color: var(--accent-red); border-color: var(--accent-red); }
 
-      .chart-head { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; }
+      .chart-head { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; flex-wrap: wrap; }
       .chart-head .tv-status { margin-left: auto; }
+      .chart-toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 10px 12px; }
       .chart-delta { display: flex; align-items: center; gap: 4px; font-size: 13px; font-weight: 700; padding: 3px 8px; border-radius: 6px; }
       .chart-delta.up { color: var(--accent-teal); background: rgba(0,208,160,0.1); }
       .chart-delta.down { color: var(--accent-red); background: rgba(255,68,79,0.1); }
       .chart-card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 12px; }
+
+      .tv-status { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 700; border-radius: 999px; padding: 4px 11px; white-space: nowrap; }
+      .tv-status svg { animation: tv-pulse 1.6s ease-in-out infinite; }
+      .tv-live { color: var(--accent-teal); background: rgba(0,208,160,0.12); border: 1px solid rgba(0,208,160,0.35); }
+      .tv-connecting { color: #ffb224; background: rgba(255,178,36,0.12); border: 1px solid rgba(255,178,36,0.4); }
+      .tv-offline { color: var(--accent-red); background: rgba(255,68,79,0.12); border: 1px solid rgba(255,68,79,0.35); }
+      @keyframes tv-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+      .tv-gran { display: inline-flex; align-items: center; gap: 4px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 9px; padding: 3px; }
+      .tv-gran-btn { background: transparent; border: none; color: var(--text-muted); padding: 6px 11px; border-radius: 7px; font-size: 12px; font-weight: 600; cursor: pointer; transition: background 0.15s ease, color 0.15s ease; }
+      .tv-gran-btn:hover { color: var(--text); }
+      .tv-gran-active { background: var(--panel); color: var(--text); box-shadow: 0 1px 3px rgba(0,0,0,0.12); }
+      .tv-banner { display: flex; align-items: center; gap: 8px; font-size: 13px; border-radius: 8px; padding: 8px 12px; }
+      .tv-banner-error { background: rgba(255,68,79,0.1); color: #ff9aa0; }
+      .tv-empty { padding: 24px; text-align: center; color: var(--text-muted); font-size: 13px; }
 
       .circle-row { display: flex; flex-direction: column; gap: 10px; max-width: 460px; }
       .circle-card { display: flex; align-items: center; gap: 12px; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 10px 14px; }
