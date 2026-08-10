@@ -2056,24 +2056,34 @@ function formatRemaining(ms) {
   return `${sec}s`;
 }
 
+// Curated "market type" selector for the Manual Trader — mirrors the
+// selector used in trading apps (Deriv DTrader / Pocket Option style).
+// Each entry maps to the buy (up/green) and sell (down/red) contract types.
+const MT_MENU = [
+  { id: 'risefall', label: 'Rise / Fall', up: 'RISE', down: 'FALL' },
+  { id: 'callput', label: 'Call / Put', up: 'CALL', down: 'PUT' },
+  { id: 'highlow', label: 'Higher / Lower', up: 'HIGHER', down: 'LOWER' },
+  { id: 'matchdiff', label: 'Matches / Differs', up: 'DIGITMATCH', down: 'DIGITDIFF' },
+  { id: 'evenodd', label: 'Even / Odd', up: 'DIGITEVEN', down: 'DIGITODD' },
+  { id: 'accumulators', label: 'Accumulators', up: 'ACCU', down: 'ACCU' },
+];
+
 function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAccount, balance, onBalanceUpdate, currency, onTradeSettled, theme }) {
   const [symbols, setSymbols] = useState([]);
   const [symbolsError, setSymbolsError] = useState(null);
   const [symbol, setSymbol] = useState(null);
 
   const [contractCategories, setContractCategories] = useState([]);
-  const [category, setCategory] = useState(null);
-  const [contractType, setContractType] = useState(null);
+  const [menu, setMenu] = useState('risefall');
 
   const [duration, setDuration] = useState(5);
   const [durationUnit, setDurationUnit] = useState('t');
   const [stake, setStake] = useState(10);
   const [basis, setBasis] = useState('stake'); // 'stake' | 'payout'
-  const [barrier, setBarrier] = useState('');
-  const [barrier2, setBarrier2] = useState('');
-  const [disabledNotice, setDisabledNotice] = useState(null);
+  const [barrier, setBarrier] = useState('+5.0');
+  const [digit, setDigit] = useState(5);
 
-  const [proposal, setProposal] = useState(null);
+  const [proposals, setProposals] = useState({ up: null, down: null });
   const [proposalLoading, setProposalLoading] = useState(false);
   const [proposalError, setProposalError] = useState(null);
 
@@ -2100,12 +2110,28 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
 
   const activeSymbol = symbols.find((s) => s.symbol === symbol) || null;
   const decimals = activeSymbol?.decimals ?? 2;
+  const currentMenu = MT_MENU.find((m) => m.id === menu) || MT_MENU[0];
+  const typeLabel = (id) => MT_TYPE_NAMES[id] || id;
 
-  const selectedCat = contractCategories.find((c) => c.category === category) || null;
-  const selectedType = (selectedCat?.types || []).find((t) => t.contract_type === contractType) || null;
-  const isDigitCat = selectedCat ? MT_DIGIT_CATEGORIES.has(selectedCat.category) : false;
-  const barrierCount = selectedType?.barriers ?? 0;
-  const typeLabel = selectedType?.label || MT_TYPE_NAMES[contractType] || contractType || 'contract';
+  // Types actually returned by Deriv for this symbol on this account.
+  const availableTypes = useMemo(() => {
+    const s = new Set();
+    for (const c of contractCategories) for (const t of c.types) s.add(t.contract_type);
+    return s;
+  }, [contractCategories]);
+  const menuAvailable = (m) => availableTypes.size === 0 || availableTypes.has(m.up) || availableTypes.has(m.down);
+
+  // Duration units/min/max come from the selected menu's contract type.
+  const activeTypeInfo = (() => {
+    let t = null;
+    for (const c of contractCategories) for (const x of c.types) if (x.contract_type === currentMenu.up) { t = x; break; }
+    if (!t) for (const c of contractCategories) for (const x of c.types) if (x.contract_type === currentMenu.down) { t = x; break; }
+    return t;
+  })();
+  const unitOptions = activeTypeInfo?.units?.length ? activeTypeInfo.units : ['t', 'm', 'h'];
+
+  const upLabel = menu === 'matchdiff' ? `Matches ${digit}` : menu === 'evenodd' ? 'Even' : menu === 'accumulators' ? 'Up' : typeLabel(currentMenu.up);
+  const downLabel = menu === 'matchdiff' ? `Differs ${digit}` : menu === 'evenodd' ? 'Odd' : menu === 'accumulators' ? 'Down' : typeLabel(currentMenu.down);
 
   // --- symbol catalog (live from Deriv) ---
   useEffect(() => {
@@ -2127,8 +2153,7 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
     setSymbol(preferred.symbol);
   }, [symbols, symbol]);
 
-  // --- available contract types for the symbol on this account, grouped by
-  // Deriv's trade-type category (Rise/Fall, Up/Down, Digits, Asians, ...) ---
+  // --- available contract types for the symbol on this account ---
   useEffect(() => {
     if (!symbol || !sessionId || !selectedAccount) return;
     let cancelled = false;
@@ -2156,7 +2181,6 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
           .map((c) => ({
             category: c,
             label: MT_CATEGORY_NAMES[c] || grouped.get(c)[0].contract_category_display || c,
-            enabled: MT_ENABLED_CATEGORIES.has(c),
             types: buildTypes(grouped.get(c)),
           }))
           .concat(
@@ -2165,40 +2189,39 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
               .map(([c, list]) => ({
                 category: c,
                 label: list[0].contract_category_display || c,
-                enabled: false,
                 types: buildTypes(list),
               }))
           );
         setContractCategories(cats);
-        const firstEnabled = cats.find((c) => c.enabled) || cats[0];
-        setCategory((prev) => (cats.some((c) => c.category === prev) ? prev : (firstEnabled ? firstEnabled.category : null)));
-        setContractType((prev) =>
-          (prev && cats.some((c) => c.types.some((t) => t.contract_type === prev))
-            ? prev
-            : (firstEnabled && firstEnabled.types[0] ? firstEnabled.types[0].contract_type : null))
-        );
       })
       .catch(() => { if (!cancelled) setContractCategories([]); });
     return () => { cancelled = true; };
   }, [symbol, sessionId, selectedAccount]);
 
-  // keep duration/unit valid for the selected contract type
+  // keep the selected market type valid for this symbol
   useEffect(() => {
-    const cat = contractCategories.find((c) => c.category === category);
-    const ct = cat && cat.types.find((t) => t.contract_type === contractType);
-    if (!ct) return;
-    setDurationUnit((prev) => (ct.units.includes(prev) ? prev : (ct.units[0] || 'm')));
-    setDuration((d) => Math.max(ct.min, Math.min(ct.max, Number(d) || ct.min)));
-  }, [category, contractType, contractCategories]);
-
-  // reset barrier inputs whenever the trade type changes
-  useEffect(() => {
-    const cat = contractCategories.find((c) => c.category === category);
-    const digit = cat ? MT_DIGIT_CATEGORIES.has(cat.category) : false;
-    setBarrier(digit ? (barrier || '5') : '');
-    setBarrier2('');
+    setMenu((prev) => {
+      if (MT_MENU.some((m) => m.id === prev && menuAvailable(m))) return prev;
+      const first = MT_MENU.find((m) => menuAvailable(m));
+      return first ? first.id : prev;
+    });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [category, contractType, contractCategories]);
+  }, [contractCategories, symbol]);
+
+  // clamp duration/unit to the selected contract type
+  useEffect(() => {
+    if (!activeTypeInfo) return;
+    setDurationUnit((prev) => (activeTypeInfo.units.includes(prev) ? prev : (activeTypeInfo.units[0] || 'm')));
+    setDuration((d) => Math.max(activeTypeInfo.min, Math.min(activeTypeInfo.max, Number(d) || activeTypeInfo.min)));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [menu, activeTypeInfo]);
+
+  // defaults + reset result whenever the market type changes
+  useEffect(() => {
+    if (menu === 'highlow' && !barrier) setBarrier('+5.0');
+    setResult(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [menu]);
 
   // --- live symbol ticks + contract updates over one socket ---
   const applyTick = (tick) => {
@@ -2245,18 +2268,18 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
     } catch { /* keep last known balance */ }
   }
 
-  // Select a Deriv trade-type category; exotic categories stay greyed out.
-  const pickCategory = (c) => {
-    if (!c.enabled) {
-      setDisabledNotice(`${c.label} requires extra parameters and isn't supported in Manual Trader yet.`);
-      return;
+  // Extra parameters each market type needs for its proposal.
+  const sideParams = (side) => {
+    const p = { contract_type: side === 'up' ? currentMenu.up : currentMenu.down };
+    if (menu === 'matchdiff') p.barrier = String(digit);
+    if (menu === 'highlow') {
+      let b = String(barrier || '+5.0').trim();
+      if (!/^[+-]/.test(b)) b = `+${b}`;
+      if (side === 'down') b = b[0] === '-' ? b.slice(1) : `-${b}`;
+      p.barrier = b;
     }
-    setDisabledNotice(null);
-    setCategory(c.category);
-    setContractType((prev) => (c.types.some((t) => t.contract_type === prev) ? prev : (c.types[0] ? c.types[0].contract_type : null)));
-    setBarrier(MT_DIGIT_CATEGORIES.has(c.category) ? '5' : '');
-    setBarrier2('');
-    setResult(null);
+    if (menu === 'accumulators') p.prediction = side === 'up' ? '1' : '-1';
+    return p;
   };
 
   useEffect(() => {
@@ -2336,44 +2359,39 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
     return () => clearInterval(id);
   }, []);
 
-  // --- proposal (price quote) for the current selection ---
+  // --- proposals (price quotes) for both buy and sell sides ---
   useEffect(() => {
-    if (!sessionId || !selectedAccount || !symbol || !contractType || contractMeta) return;
+    if (!sessionId || !selectedAccount || !symbol || !menu || contractMeta) { setProposals({ up: null, down: null }); return; }
     let cancelled = false;
     setProposalLoading(true);
     setProposalError(null);
     const t = setTimeout(() => {
-      fetch(`${API_BASE}/api/contract/proposal`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          session: sessionId,
-          account: selectedAccount,
-          symbol,
-          contract_type: contractType,
-          amount: stake,
-          basis,
-          duration,
-          duration_unit: durationUnit,
-          currency,
-          barrier: barrier || undefined,
-          barrier2: barrier2 || undefined,
-        }),
-      })
-        .then(async (r) => {
-          const data = await r.json();
-          if (!r.ok) throw new Error(data.error || 'Proposal failed');
-          if (!cancelled) { setProposal(data.proposal); setProposalError(null); }
+      const fetchSide = (side) => {
+        const params = sideParams(side);
+        return fetch(`${API_BASE}/api/contract/proposal`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ session: sessionId, account: selectedAccount, symbol, amount: stake, basis, duration, duration_unit: durationUnit, currency, ...params }),
         })
-        .catch((e) => { if (!cancelled) { setProposal(null); setProposalError(e.message); } })
-        .finally(() => { if (!cancelled) setProposalLoading(false); });
+          .then(async (r) => {
+            const d = await r.json();
+            if (!r.ok) throw new Error(d.error || 'Proposal failed');
+            return d.proposal;
+          })
+          .catch((e) => { if (!cancelled) setProposalError(e.message); return null; });
+      };
+      Promise.all([fetchSide('up'), fetchSide('down')]).then(([u, d]) => {
+        if (!cancelled) setProposals({ up: u, down: d });
+      }).finally(() => { if (!cancelled) setProposalLoading(false); });
     }, 250);
     return () => { cancelled = true; clearTimeout(t); };
-  }, [sessionId, selectedAccount, symbol, contractType, stake, basis, duration, durationUnit, currency, barrier, barrier2, contractMeta]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionId, selectedAccount, symbol, menu, duration, durationUnit, stake, basis, currency, barrier, digit, contractMeta]);
 
-  // --- buy a real contract ---
-  async function handleBuy() {
-    if (!proposal || busy || contractMeta) return;
+  // --- buy a real contract for the chosen side (green up / red down) ---
+  async function handleBuy(side) {
+    const p = proposals[side];
+    if (!p || busy || contractMeta) return;
     setBusy(true);
     setActionError(null);
     setResult(null);
@@ -2381,7 +2399,7 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
       const res = await fetch(`${API_BASE}/api/contract/buy`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ session: sessionId, account: selectedAccount, proposal_id: proposal.id, price: proposal.ask_price }),
+        body: JSON.stringify({ session: sessionId, account: selectedAccount, proposal_id: p.id, price: p.ask_price }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Buy failed');
@@ -2389,14 +2407,14 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
       settleRef.current = null;
       setContractMeta({
         ...buy,
-        contract_type: contractType,
+        contract_type: p.contract_type,
         symbol,
         duration,
         duration_unit: durationUnit,
-        date_expiry: proposal.date_expiry,
-        tick_count: proposal.tick_count,
-        payout: proposal.payout,
-        longcode: proposal.longcode,
+        date_expiry: p.date_expiry,
+        tick_count: p.tick_count,
+        payout: p.payout,
+        longcode: p.longcode,
       });
       setContract(null);
       refreshBalance();
@@ -2451,14 +2469,36 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
   const currentTick = contract?.current_tick;
   const remainingTicks = (totalTicks != null && currentTick != null) ? Math.max(0, totalTicks - currentTick) : null;
 
-  const lastPrice = lastTick?.quote ?? contract?.current_spot ?? proposal?.spot ?? null;
+  const lastPrice = lastTick?.quote ?? contract?.current_spot ?? proposals.up?.spot ?? proposals.down?.spot ?? null;
   const entryPoint = contract?.entry_spot != null
     ? { price: contract.entry_spot, time: contract.entry_tick_time }
     : (contractMeta?.entry_spot != null ? { price: contractMeta.entry_spot, time: contractMeta.entry_tick_time } : null);
-  const profitEstimate = proposal ? proposal.payout - proposal.ask_price : null;
 
   // 1-second candles from the live tick feed for the trade chart
   const candles = useMemo(() => aggregateCandles(ticks, 1), [ticks]);
+
+  // Last-digit stats from live ticks (used by the digits / even-odd pads).
+  const digitStats = useMemo(() => {
+    const counts = new Array(10).fill(0);
+    let total = 0;
+    for (const t of ticks) {
+      if (t == null || t.price == null) continue;
+      const s = t.price.toFixed(decimals);
+      const d = Number(s[s.length - 1]);
+      if (Number.isInteger(d) && d >= 0 && d <= 9) { counts[d] += 1; total += 1; }
+    }
+    return { counts, total, pct: counts.map((c) => (total ? (c / total) * 100 : 10)) };
+  }, [ticks, decimals]);
+  const currentDigit = lastPrice == null ? null : Number(lastPrice.toFixed(decimals).slice(-1));
+  const evenPct = digitStats.pct.filter((_, i) => i % 2 === 0).reduce((a, b) => a + b, 0);
+  const oddPct = 100 - evenPct;
+
+  // Absolute barrier price from the proposal, drawn on the chart.
+  const proposalBarrier = (() => {
+    const p = proposals.up || proposals.down;
+    if (p && p.barrier != null) { const n = Number(p.barrier); if (Number.isFinite(n)) return n; }
+    return null;
+  })();
 
   const wsLabel = wsStatus === 'live' ? 'Live' : wsStatus === 'connecting' ? 'Connecting' : 'Offline';
   const wsClass = wsStatus === 'live' ? 'tv-live' : wsStatus === 'connecting' ? 'tv-connecting' : 'tv-offline';
@@ -2470,6 +2510,15 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
         ? `${marketStatus.symbol} is not available on this account/app (${marketStatus.code}).`
         : (marketStatus.message || marketStatus.code))
     : null;
+
+  const onSymbolChange = (e) => {
+    setSymbol(e.target.value);
+    setContract(null);
+    setContractMeta(null);
+    setResult(null);
+    setTicks([]);
+    setLastTick(null);
+  };
 
   if (!sessionId) {
     return (
@@ -2483,26 +2532,16 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
   }
 
   return (
-    <div className="section">
-      <div className="mt-head">
+    <div className="section mt-app">
+      <div className="mt-topbar">
         <h2 className="section-title">Manual Trader</h2>
-        <span className={`tv-status ${wsClass}`}><Radio size={13} /> {wsLabel}</span>
-        <span className="mt-balance">
-          Balance: <b>{balance ? `${balance.balance} ${balance.currency}` : '—'}</b>
-        </span>
-      </div>
-
-      <div className="mt-grid">
-        <div className="card mt-form">
-          <label className="card-label">Account</label>
-          <select className="select" value={selectedAccount || ''} onChange={(e) => setSelectedAccount(e.target.value)}>
+        <div className="mt-top-controls">
+          <select className="select mt-account-select" value={selectedAccount || ''} onChange={(e) => setSelectedAccount(e.target.value)}>
             {accounts.map((a) => (
               <option key={a.account} value={a.account}>{a.account} ({a.currency})</option>
             ))}
           </select>
-
-          <label className="card-label">Symbol</label>
-          <select className="select" value={symbol || ''} onChange={(e) => { setSymbol(e.target.value); setContract(null); setContractMeta(null); setResult(null); setTicks([]); setLastTick(null); }} disabled={symbols.length === 0}>
+          <select className="select mt-symbol-select" value={symbol || ''} onChange={onSymbolChange} disabled={symbols.length === 0}>
             {symbol === null && <option value="">Loading symbols…</option>}
             {Object.entries(
               symbols.reduce((groups, s) => {
@@ -2518,233 +2557,194 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
               </optgroup>
             ))}
           </select>
-          {symbolsError && <p className="mt-hint">Symbol list unavailable: {symbolsError}</p>}
-          {marketNotice && (
-            <div className="mt-error"><AlertTriangle size={13} /> {marketNotice}</div>
-          )}
+          <span className={`tv-status ${wsClass}`}><Radio size={13} /> {wsLabel}</span>
+          <span className="mt-balance">Balance: <b>{balance ? `${balance.balance} ${balance.currency}` : '—'}</b></span>
+        </div>
+      </div>
 
-          <div className="mt-market-type">
-            <div className="mt-market-row"><span>Market</span><b>{activeSymbol ? (MT_MARKET_LABELS[activeSymbol.market] || activeSymbol.market) : '—'}</b></div>
-            <div className="mt-market-row"><span>Contract</span><b>{contractType ? typeLabel : '—'}</b></div>
-            <div className="mt-market-row"><span>Duration</span><b>{duration}{MT_UNIT_LABELS[durationUnit] ? ` ${MT_UNIT_LABELS[durationUnit]}` : ''}</b></div>
-          </div>
+      {symbolsError && <p className="mt-hint">Symbol list unavailable: {symbolsError}</p>}
+      {marketNotice && (
+        <div className="mt-error"><AlertTriangle size={13} /> {marketNotice}</div>
+      )}
 
-          <label className="card-label">Trade type</label>
-          {disabledNotice && (
-            <div className="mt-error"><AlertTriangle size={13} /> {disabledNotice}</div>
-          )}
-          <div className="mt-categories">
-            {contractCategories.map((c) => (
-              <button
-                key={c.category}
-                className={`mt-cat-btn ${category === c.category ? 'mt-cat-active' : ''} ${c.enabled ? '' : 'mt-cat-disabled'}`}
-                onClick={() => pickCategory(c)}
-                title={c.enabled ? undefined : 'Requires extra parameters — not available in Manual Trader yet.'}
-              >
-                {c.label}
-              </button>
+      <div className="mt-params">
+        <div className="mt-param">
+          <span className="mt-param-label">Market type</span>
+          <select className="select mt-menu-select" value={menu} onChange={(e) => { setMenu(e.target.value); setResult(null); }}>
+            {MT_MENU.map((m) => (
+              <option key={m.id} value={m.id} disabled={!menuAvailable(m)}>{m.label}</option>
             ))}
-            {contractCategories.length === 0 && <span className="mt-hint">No tradable contract types returned for this symbol.</span>}
-          </div>
+          </select>
+        </div>
 
-          {selectedCat && (
-            <>
-              <label className="card-label">{selectedCat.label}</label>
-              <div className="mt-types">
-                {selectedCat.types.map((t) => (
-                  <button
-                    key={t.contract_type}
-                    className={`mt-type-btn ${contractType === t.contract_type ? 'mt-type-active' : ''}`}
-                    onClick={() => { setContractType(t.contract_type); setBarrier(''); setBarrier2(''); setResult(null); }}
-                  >
-                    {t.label}
-                  </button>
-                ))}
-              </div>
-            </>
-          )}
-
-          <label className="card-label">Duration</label>
+        <div className="mt-param">
+          <span className="mt-param-label">Duration</span>
           <div className="mt-duration">
-            <input
-              className="select mt-duration-input"
-              type="number"
-              min="1"
-              value={duration}
-              onChange={(e) => setDuration(Number(e.target.value))}
-            />
+            <input className="select mt-duration-input" type="number" min="1" value={duration} onChange={(e) => setDuration(Number(e.target.value))} />
             <div className="mt-units">
-              {(selectedType?.units || ['t', 'm', 'h']).map((u) => (
-                <button
-                  key={u}
-                  className={`mt-unit-btn ${durationUnit === u ? 'mt-unit-active' : ''}`}
-                  onClick={() => setDurationUnit(u)}
-                >
+              {unitOptions.map((u) => (
+                <button key={u} className={`mt-unit-btn ${durationUnit === u ? 'mt-unit-active' : ''}`} onClick={() => setDurationUnit(u)}>
                   {MT_UNIT_LABELS[u]}
                 </button>
               ))}
             </div>
           </div>
+        </div>
 
-          {isDigitCat && (
-            <>
-              <label className="card-label">Last digit prediction</label>
-              <div className="mt-digits">
-                {Array.from({ length: 10 }, (_, d) => (
-                  <button
-                    key={d}
-                    className={`mt-digit-btn ${barrier === String(d) ? 'mt-digit-active' : ''}`}
-                    onClick={() => setBarrier(String(d))}
-                  >
-                    {d}
-                  </button>
-                ))}
-              </div>
-            </>
-          )}
-
-          {!isDigitCat && barrierCount >= 1 && (
-            <>
-              <label className="card-label">Barrier {barrierCount >= 2 ? '(high)' : ''}</label>
-              <input
-                className="select"
-                type="text"
-                value={barrier}
-                placeholder={barrierCount >= 2 ? 'e.g. +5.0' : 'e.g. +5.0 or 12000'}
-                onChange={(e) => setBarrier(e.target.value)}
-              />
-            </>
-          )}
-
-          {!isDigitCat && barrierCount >= 2 && (
-            <>
-              <label className="card-label">Barrier (low)</label>
-              <input
-                className="select"
-                type="text"
-                value={barrier2}
-                placeholder="e.g. -5.0"
-                onChange={(e) => setBarrier2(e.target.value)}
-              />
-            </>
-          )}
-
-          <label className="card-label">Amount basis</label>
-          <div className="mt-units">
-            {['stake', 'payout'].map((b) => (
-              <button
-                key={b}
-                className={`mt-unit-btn ${basis === b ? 'mt-unit-active' : ''}`}
-                onClick={() => setBasis(b)}
-              >
-                {b === 'stake' ? 'Stake' : 'Payout'}
-              </button>
-            ))}
-          </div>
-
-          <label className="card-label">{basis === 'payout' ? `Payout (${currency})` : `Stake (${currency})`}</label>
-          <input
-            className="select"
-            type="number"
-            min="1"
-            step="0.01"
-            value={stake}
-            onChange={(e) => setStake(Number(e.target.value))}
-          />
-
-          <div className="mt-quote">
-            <div className="mt-quote-row"><span>Spot</span><b>{lastPrice == null ? '—' : lastPrice.toLocaleString(undefined, { maximumFractionDigits: decimals })}</b></div>
-            <div className="mt-quote-row"><span>Stake</span><b>{proposal ? proposal.ask_price.toLocaleString(undefined, { maximumFractionDigits: 2 }) : '—'}</b></div>
-            <div className="mt-quote-row"><span>Payout</span><b>{proposal ? proposal.payout.toLocaleString(undefined, { maximumFractionDigits: 2 }) : '—'}</b></div>
-            <div className="mt-quote-row">
-              <span>Profit if won</span>
-              <b className={profitEstimate != null && profitEstimate >= 0 ? 'roi-up' : 'roi-down'}>
-                {proposalLoading ? '…' : (profitEstimate == null ? '—' : `${profitEstimate >= 0 ? '+' : ''}${profitEstimate.toFixed(2)}`)}
-              </b>
+        <div className="mt-param">
+          <span className="mt-param-label">{basis === 'payout' ? `Payout (${currency})` : `Stake (${currency})`}</span>
+          <div className="mt-stake-row">
+            <input className="select mt-stake-input" type="number" min="1" step="0.01" value={stake} onChange={(e) => setStake(Number(e.target.value))} />
+            <div className="mt-units">
+              {['stake', 'payout'].map((b) => (
+                <button key={b} className={`mt-unit-btn ${basis === b ? 'mt-unit-active' : ''}`} onClick={() => setBasis(b)}>
+                  {b === 'stake' ? 'Stake' : 'Payout'}
+                </button>
+              ))}
             </div>
           </div>
+        </div>
 
-          {(proposalError || actionError) && (
-            <div className="mt-error"><AlertTriangle size={13} /> {proposalError || actionError}</div>
+        {menu === 'highlow' && (
+          <div className="mt-param">
+            <span className="mt-param-label">Barrier</span>
+            <input className="select mt-barrier-input" type="text" value={barrier} onChange={(e) => setBarrier(e.target.value)} placeholder="+5.0" />
+          </div>
+        )}
+      </div>
+
+      <div className="card mt-chart-card">
+        <div className="mt-chart-top">
+          <span className="mt-type-badge">
+            {symbol || '—'} · {currentMenu.label} · {duration} {MT_UNIT_LABELS[durationUnit]}{contractMeta ? ` · ${typeLabel(contractMeta.contract_type)}` : ''}
+          </span>
+          {contractMeta && isTickContract && (
+            <span className="mt-timer">⏱ {remainingTicks == null ? '—' : `${remainingTicks} ticks left`}</span>
           )}
-
-          <button className="btn-buy mt-buy" onClick={handleBuy} disabled={!proposal || busy || !!contractMeta}>
-            <span className="mt-buy-label">{busy ? 'Buying…' : `Buy ${typeLabel}`}</span>
-            {proposal && !busy && (
-              <span className="mt-buy-sub">
-                {basis === 'payout'
-                  ? `${proposal.ask_price.toLocaleString(undefined, { maximumFractionDigits: 2 })} ${currency} stake · ${stake.toLocaleString(undefined, { maximumFractionDigits: 2 })} payout`
-                  : `Payout ${proposal.payout.toLocaleString(undefined, { maximumFractionDigits: 2 })} ${currency}`}
-              </span>
-            )}
-          </button>
-
-          {contractMeta && (
-            <div className="mt-open">
-              <div className="card-label">Open contract</div>
-              <div className="mt-open-row"><span>Entry</span><b>{contract?.entry_spot == null ? '—' : contract.entry_spot.toLocaleString(undefined, { maximumFractionDigits: decimals })}</b></div>
-              <div className="mt-open-row"><span>Current</span><b>{contract?.current_spot == null ? '—' : contract.current_spot.toLocaleString(undefined, { maximumFractionDigits: decimals })}</b></div>
-              <div className="mt-open-row"><span>Sell now at</span><b>{contract?.sell_price == null ? '—' : contract.sell_price.toLocaleString(undefined, { maximumFractionDigits: decimals })}</b></div>
-              <button className="btn-sell mt-sell" onClick={handleSell} disabled={!contract?.is_valid_to_sell || selling}>
-                {selling ? 'Selling…' : 'Sell now'}
-              </button>
-              {!contract?.is_valid_to_sell && <p className="mt-hint">Contract can&apos;t be sold yet.</p>}
-            </div>
-          )}
-
-          {result && (
-            <div className={`mt-result ${result.won ? 'mt-result-won' : 'mt-result-lost'}`}>
-              <b>{result.soldEarly ? (result.won ? 'Closed at a profit' : 'Closed at a loss') : (result.won ? 'Contract won' : 'Contract lost')}</b>
-              <span>{result.profit >= 0 ? '+' : ''}{result.profit.toFixed(2)} {currency}</span>
-            </div>
+          {contractMeta && !isTickContract && (
+            <span className="mt-timer">⏱ {formatRemaining(remainingMs)} left</span>
           )}
         </div>
 
-        <div className="card mt-chart-card">
-          <div className="mt-chart-top">
-            <span className="mt-type-badge">
-              {symbol || '—'} · {contractType ? typeLabel : '—'} · {duration} {MT_UNIT_LABELS[durationUnit]}
-            </span>
-            {contractMeta && isTickContract && (
-              <span className="mt-timer">⏱ {remainingTicks == null ? '—' : `${remainingTicks} ticks left`}</span>
-            )}
-            {contractMeta && !isTickContract && (
-              <span className="mt-timer">⏱ {formatRemaining(remainingMs)} left</span>
-            )}
+        {candles.length === 0 ? (
+          <div className="tv-empty mt-empty-chart">
+            <Activity size={18} />
+            <span>Live 1s candles — waiting for ticks…</span>
           </div>
+        ) : (
+          <CandleFeedChart
+            candles={candles}
+            decimals={decimals}
+            entryPoint={entryPoint}
+            lastPrice={lastPrice}
+            direction={contractMeta?.contract_type ?? currentMenu.up}
+            barrierLine={menu === 'highlow' ? proposalBarrier : null}
+            theme={theme}
+          />
+        )}
 
-          {candles.length === 0 ? (
-            <div className="tv-empty mt-empty-chart">
-              <Activity size={18} />
-              <span>Live 1s candles — waiting for ticks…</span>
-            </div>
-          ) : (
-            <CandleFeedChart
-              candles={candles}
-              decimals={decimals}
-              entryPoint={entryPoint}
-              lastPrice={lastPrice}
-              direction={contractType}
-              theme={theme}
-            />
-          )}
-
-          <div className="mt-strip">
-            <div className="mt-strip-cell">
-              <span>Current price</span>
-              <b>{lastPrice == null ? '—' : lastPrice.toLocaleString(undefined, { maximumFractionDigits: decimals })}</b>
-            </div>
-            <div className="mt-strip-cell">
-              <span>Entry point</span>
-              <b>{contract?.entry_spot == null ? '—' : contract.entry_spot.toLocaleString(undefined, { maximumFractionDigits: decimals })}</b>
-            </div>
-            <div className="mt-strip-cell">
-              <span>Market type</span>
-              <b>{activeSymbol ? (MT_MARKET_LABELS[activeSymbol.market] || activeSymbol.market) : '—'}</b>
-            </div>
+        <div className="mt-strip">
+          <div className="mt-strip-cell">
+            <span>Current price</span>
+            <b>{lastPrice == null ? '—' : lastPrice.toLocaleString(undefined, { maximumFractionDigits: decimals })}</b>
+          </div>
+          <div className="mt-strip-cell">
+            <span>Entry point</span>
+            <b>{entryPoint?.price == null ? '—' : entryPoint.price.toLocaleString(undefined, { maximumFractionDigits: decimals })}</b>
+          </div>
+          <div className="mt-strip-cell">
+            <span>Market type</span>
+            <b>{activeSymbol ? (MT_MARKET_LABELS[activeSymbol.market] || activeSymbol.market) : '—'}</b>
           </div>
         </div>
       </div>
+
+      {(menu === 'matchdiff' || menu === 'evenodd') && (
+        <div className="card mt-digitpad">
+          <div className="mt-digitpad-head">
+            <span className="card-label">{menu === 'matchdiff' ? 'Pick the last digit' : 'Last digit distribution'}</span>
+            <span className="mt-hint">{currentDigit == null ? 'waiting for a tick…' : `current last digit: ${currentDigit}`}</span>
+          </div>
+          <div className="mt-digitpad-row">
+            {Array.from({ length: 10 }, (_, d) => {
+              const hit = currentDigit === d;
+              const active = menu === 'matchdiff' && digit === d;
+              const inner = (
+                <>
+                  <span className="mt-pad-num">{d}</span>
+                  <span className="mt-pad-pct">{digitStats.pct[d].toFixed(0)}%</span>
+                </>
+              );
+              return menu === 'matchdiff' ? (
+                <button key={d} className={`mt-pad-digit ${active ? 'mt-pad-active' : ''} ${hit ? 'mt-pad-hit' : ''}`} onClick={() => setDigit(d)}>
+                  {inner}
+                </button>
+              ) : (
+                <div key={d} className={`mt-pad-digit ${hit ? 'mt-pad-hit' : ''}`}>{inner}</div>
+              );
+            })}
+          </div>
+          {menu === 'evenodd' && (
+            <div className="mt-evenodd-bar">
+              <div className="mt-evenodd-track">
+                <div className="mt-evenodd-fill" style={{ width: `${evenPct}%` }} />
+              </div>
+              <div className="mt-evenodd-labels">
+                <span>Even {evenPct.toFixed(0)}%</span>
+                <span>Odd {oddPct.toFixed(0)}%</span>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {contractMeta && (
+        <div className="card mt-open-card">
+          <div className="card-label">Open contract · {typeLabel(contractMeta.contract_type)}</div>
+          <div className="mt-open-grid">
+            <div className="mt-open-cell"><span>Entry</span><b>{contract?.entry_spot == null ? '—' : contract.entry_spot.toLocaleString(undefined, { maximumFractionDigits: decimals })}</b></div>
+            <div className="mt-open-cell"><span>Current</span><b>{contract?.current_spot == null ? '—' : contract.current_spot.toLocaleString(undefined, { maximumFractionDigits: decimals })}</b></div>
+            <div className="mt-open-cell"><span>Sell now at</span><b>{contract?.sell_price == null ? '—' : contract.sell_price.toLocaleString(undefined, { maximumFractionDigits: decimals })}</b></div>
+            <div className="mt-open-cell"><span>Potential payout</span><b>{contractMeta.payout != null ? contractMeta.payout.toLocaleString(undefined, { maximumFractionDigits: 2 }) : '—'} {currency}</b></div>
+          </div>
+        </div>
+      )}
+
+      <div className="mt-bottom-actions">
+        {contractMeta ? (
+          <div className="mt-open-inline">
+            <div className="mt-open-cell"><span>Entry</span><b>{contract?.entry_spot == null ? '—' : contract.entry_spot.toLocaleString(undefined, { maximumFractionDigits: decimals })}</b></div>
+            <div className="mt-open-cell"><span>Current</span><b>{contract?.current_spot == null ? '—' : contract.current_spot.toLocaleString(undefined, { maximumFractionDigits: decimals })}</b></div>
+            <div className="mt-open-cell"><span>Sell at</span><b>{contract?.sell_price == null ? '—' : contract.sell_price.toLocaleString(undefined, { maximumFractionDigits: decimals })}</b></div>
+            <button className="mt-sell-btn" onClick={handleSell} disabled={!contract?.is_valid_to_sell || selling}>
+              {selling ? 'Selling…' : 'Sell now'}
+            </button>
+            {!contract?.is_valid_to_sell && <span className="mt-hint">Not sellable yet</span>}
+          </div>
+        ) : (
+          <>
+            <button className="mt-side-btn mt-side-down" onClick={() => handleBuy('down')} disabled={!proposals.down || busy || proposalLoading}>
+              <span className="mt-side-label">{downLabel}</span>
+              <span className="mt-side-payout">{proposalLoading ? 'Pricing…' : (proposals.down ? `Payout ${proposals.down.payout.toLocaleString(undefined, { maximumFractionDigits: 2 })} ${currency}` : 'No price')}</span>
+            </button>
+            <button className="mt-side-btn mt-side-up" onClick={() => handleBuy('up')} disabled={!proposals.up || busy || proposalLoading}>
+              <span className="mt-side-label">{upLabel}</span>
+              <span className="mt-side-payout">{proposalLoading ? 'Pricing…' : (proposals.up ? `Payout ${proposals.up.payout.toLocaleString(undefined, { maximumFractionDigits: 2 })} ${currency}` : 'No price')}</span>
+            </button>
+          </>
+        )}
+      </div>
+
+      {result && (
+        <div className={`mt-result ${result.won ? 'mt-result-won' : 'mt-result-lost'}`}>
+          <b>{result.soldEarly ? (result.won ? 'Closed at a profit' : 'Closed at a loss') : (result.won ? 'Contract won' : 'Contract lost')}</b>
+          <span>{result.profit >= 0 ? '+' : ''}{result.profit.toFixed(2)} {currency}</span>
+        </div>
+      )}
+
+      {(proposalError || actionError) && (
+        <div className="mt-error"><AlertTriangle size={13} /> {proposalError || actionError}</div>
+      )}
     </div>
   );
 }
@@ -2869,7 +2869,7 @@ function LineFeedChart({ points, candles, chartType, decimals, entryPoint, lastP
         axisLabelVisible: true,
       });
       if (entryPoint.time) {
-        const up = direction === 'RISE' || direction === 'CALL' || direction === 'ASIAU' || direction === 'UPORDOWN';
+        const up = direction === 'RISE' || direction === 'CALL' || direction === 'HIGHER' || direction === 'DIGITEVEN' || direction === 'DIGITMATCH' || direction === 'ASIAU' || direction === 'UPORDOWN';
         markersRef.current?.setMarkers([{
           time: entryPoint.time,
           position: up ? 'belowBar' : 'aboveBar',
@@ -2898,6 +2898,26 @@ function LineFeedChart({ points, candles, chartType, decimals, entryPoint, lastP
       });
     }
   }, [lastPrice]);
+
+  // barrier price line (Highs/Lows trades) — dashed indigo marker
+  useEffect(() => {
+    const series = seriesRef.current;
+    if (!series) return;
+    if (barrierLineRef.current) {
+      try { series.removePriceLine(barrierLineRef.current); } catch { /* noop */ }
+      barrierLineRef.current = null;
+    }
+    if (barrierLine != null && Number.isFinite(barrierLine)) {
+      barrierLineRef.current = series.createPriceLine({
+        price: barrierLine,
+        color: '#4c6ef5',
+        lineWidth: 1,
+        lineStyle: LineStyle.Dashed,
+        title: 'Barrier',
+        axisLabelVisible: true,
+      });
+    }
+  }, [barrierLine]);
 
   return <div className="mt-chart-canvas" ref={containerRef} />;
 }
@@ -2932,12 +2952,13 @@ function aggregateCandles(ticks, granSec) {
 // price line. Updates incrementally without rebuilding the chart.
 // ---------------------------------------------------------------------
 
-function CandleFeedChart({ candles, decimals, entryPoint, lastPrice, direction, theme }) {
+function CandleFeedChart({ candles, decimals, entryPoint, lastPrice, direction, barrierLine, theme }) {
   const containerRef = useRef(null);
   const chartRef = useRef(null);
   const seriesRef = useRef(null);
   const entryLineRef = useRef(null);
   const currentLineRef = useRef(null);
+  const barrierLineRef = useRef(null);
   const markersRef = useRef(null);
   const appliedLen = useRef(0);
 
@@ -2992,6 +3013,7 @@ function CandleFeedChart({ candles, decimals, entryPoint, lastPrice, direction, 
       seriesRef.current = null;
       entryLineRef.current = null;
       currentLineRef.current = null;
+      barrierLineRef.current = null;
       markersRef.current = null;
       appliedLen.current = 0;
     };
@@ -3037,7 +3059,7 @@ function CandleFeedChart({ candles, decimals, entryPoint, lastPrice, direction, 
         axisLabelVisible: true,
       });
       if (entryPoint.time) {
-        const up = direction === 'RISE' || direction === 'CALL' || direction === 'ASIAU' || direction === 'UPORDOWN';
+        const up = direction === 'RISE' || direction === 'CALL' || direction === 'HIGHER' || direction === 'DIGITEVEN' || direction === 'DIGITMATCH' || direction === 'ASIAU' || direction === 'UPORDOWN';
         markersRef.current?.setMarkers([{
           time: entryPoint.time,
           position: up ? 'belowBar' : 'aboveBar',
@@ -3668,6 +3690,63 @@ function GlobalStyle() {
       .mt-strip-cell { background: var(--panel-2); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; display: flex; flex-direction: column; gap: 2px; }
       .mt-strip-cell span { font-size: 11px; color: var(--text-muted); font-weight: 600; }
       .mt-strip-cell b { font-size: 14px; font-family: 'SFMono-Regular', Consolas, monospace; }
+
+      /* Rebuilt Manual Trader (trading-app style) */
+      .mt-app { display: flex; flex-direction: column; gap: 12px; max-width: 860px; }
+      .mt-topbar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+      .mt-topbar .section-title { margin: 0; }
+      .mt-top-controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-left: auto; }
+      .mt-account-select { width: auto; min-width: 150px; padding: 8px 10px; }
+      .mt-symbol-select { width: 270px; max-width: 100%; padding: 8px 10px; }
+      .mt-params { display: flex; align-items: flex-end; gap: 12px; flex-wrap: wrap; background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 12px; }
+      .mt-param { display: flex; flex-direction: column; gap: 5px; }
+      .mt-param-label { font-size: 11px; font-weight: 700; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.03em; }
+      .mt-menu-select { min-width: 190px; }
+      .mt-duration-input { width: 72px; }
+      .mt-stake-row { display: flex; align-items: center; gap: 6px; }
+      .mt-stake-input { width: 96px; }
+      .mt-barrier-input { width: 110px; }
+      .mt-chart-card { min-height: 380px; }
+      .mt-digitpad { display: flex; flex-direction: column; gap: 10px; padding: 14px; }
+      .mt-digitpad-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+      .mt-digitpad-row { display: flex; gap: 8px; justify-content: space-between; overflow-x: auto; padding-bottom: 2px; }
+      .mt-pad-digit { display: flex; flex-direction: column; align-items: center; gap: 3px; flex: 1 0 44px; min-width: 44px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 999px; padding: 10px 4px; cursor: pointer; transition: transform 0.15s ease, box-shadow 0.15s ease, background 0.15s ease; }
+      .mt-pad-digit:hover { transform: translateY(-2px); }
+      .mt-pad-num { font-size: 20px; font-weight: 800; line-height: 1; }
+      .mt-pad-pct { font-size: 10px; color: var(--text-muted); font-weight: 600; }
+      .mt-pad-active { border-color: var(--accent-indigo); background: rgba(76,110,245,0.14); box-shadow: 0 0 0 2px rgba(76,110,245,0.25); }
+      .mt-pad-hit { animation: mt-digit-flash 1s ease-in-out infinite; border-color: var(--accent-teal); }
+      .mt-pad-hit .mt-pad-num { color: var(--accent-teal); }
+      @keyframes mt-digit-flash { 0%, 100% { box-shadow: 0 0 0 0 rgba(0,208,160,0.55); transform: scale(1); } 50% { box-shadow: 0 0 0 7px rgba(0,208,160,0); transform: scale(1.14); } }
+      .mt-evenodd-bar { display: flex; flex-direction: column; gap: 4px; }
+      .mt-evenodd-track { height: 10px; border-radius: 999px; background: var(--panel-2); border: 1px solid var(--border); overflow: hidden; }
+      .mt-evenodd-fill { height: 100%; border-radius: 999px; background: linear-gradient(90deg, var(--accent-teal), var(--accent-indigo)); transition: width 0.4s ease; }
+      .mt-evenodd-labels { display: flex; justify-content: space-between; font-size: 11px; font-weight: 600; }
+      .mt-open-card { display: flex; flex-direction: column; gap: 10px; }
+      .mt-open-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; }
+      .mt-open-cell { display: flex; flex-direction: column; gap: 2px; font-size: 11px; color: var(--text-muted); }
+      .mt-open-cell b { font-size: 14px; color: var(--text); font-family: 'SFMono-Regular', Consolas, monospace; }
+      .mt-bottom-actions { position: sticky; bottom: 0; z-index: 40; display: flex; gap: 10px; background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 10px; box-shadow: 0 -6px 24px rgba(0,0,0,0.12); }
+      .mt-side-btn { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; border: none; border-radius: 12px; padding: 14px 10px; font-weight: 800; font-size: 15px; cursor: pointer; transition: transform 0.12s ease, filter 0.12s ease; }
+      .mt-side-btn:hover:not(:disabled) { transform: translateY(-2px); filter: brightness(1.05); }
+      .mt-side-btn:disabled { opacity: 0.55; cursor: not-allowed; }
+      .mt-side-up { background: linear-gradient(180deg, #00e6b0, #00b894); color: #03241a; }
+      .mt-side-down { background: linear-gradient(180deg, #ff5a63, #e8414c); color: #2b0507; }
+      .mt-side-label { font-size: 16px; line-height: 1.1; }
+      .mt-side-payout { font-size: 12px; opacity: 0.85; font-weight: 600; }
+      .mt-open-inline { flex: 1; display: flex; align-items: center; gap: 16px; flex-wrap: wrap; padding: 2px 6px; }
+      .mt-sell-btn { margin-left: auto; background: var(--accent-red); color: #fff; border: none; border-radius: 10px; padding: 12px 22px; font-weight: 800; font-size: 14px; cursor: pointer; }
+      .mt-sell-btn:hover:not(:disabled) { filter: brightness(1.1); }
+      .mt-sell-btn:disabled { opacity: 0.55; cursor: not-allowed; }
+      @media (max-width: 640px) {
+        .mt-top-controls { margin-left: 0; width: 100%; }
+        .mt-symbol-select { flex: 1 1 100%; }
+        .mt-params { align-items: stretch; }
+        .mt-param { flex: 1 1 45%; }
+        .mt-menu-select, .mt-barrier-input { width: 100%; }
+        .mt-bottom-actions { flex-direction: column-reverse; }
+        .mt-side-btn { padding: 16px 10px; }
+      }
 
       .chart-toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
       .chart-symbol-select { width: 320px; max-width: 100%; }

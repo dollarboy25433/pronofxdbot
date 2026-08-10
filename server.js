@@ -473,13 +473,13 @@ app.post('/api/contract/proposal', async (req, res) => {
   const ctx = findSession(req, res);
   if (!ctx) return;
 
-  const { symbol, contract_type, amount, basis = 'stake', duration, duration_unit = 'm', currency } = req.body || {};
+  const { symbol, contract_type, amount, basis = 'stake', duration, duration_unit = 'm', currency, barrier, barrier2, prediction } = req.body || {};
   if (!symbol || !contract_type || amount == null || duration == null) {
     return res.status(400).json({ error: 'Missing symbol, contract_type, amount or duration' });
   }
 
   try {
-    const result = await derivRequest(ctx.acct.token, {
+    const payload = {
       proposal: 1,
       amount,
       basis,
@@ -488,7 +488,14 @@ app.post('/api/contract/proposal', async (req, res) => {
       duration,
       duration_unit,
       symbol,
-    }, { label: 'proposal', context: { symbol, contract_type, account: ctx.acct.account } });
+    };
+    // Digits (Matches/Differs/Over/Under), Highs/Lows and Ends In/Out carry
+    // barriers; Accumulators use a `prediction` instead. Forward them so
+    // those trade types actually price correctly.
+    if (barrier !== undefined && barrier !== '') payload.barrier = barrier;
+    if (barrier2 !== undefined && barrier2 !== '') payload.barrier2 = barrier2;
+    if (prediction !== undefined && prediction !== '') payload.prediction = prediction;
+    const result = await derivRequest(ctx.acct.token, payload, { label: 'proposal', context: { symbol, contract_type, account: ctx.acct.account } });
     res.json({ proposal: result.proposal });
   } catch (err) {
     apiError(res, 502, err);
