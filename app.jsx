@@ -79,7 +79,7 @@ export default function App() {
 
   // --- Theme ('dark' | 'light' | 'system') ---
   const [theme, setTheme] = useState(() => {
-    try { return localStorage.getItem('theme') || 'dark'; } catch { return 'dark'; }
+    try { return localStorage.getItem('theme') || 'light'; } catch { return 'light'; }
   });
 
   useEffect(() => {
@@ -294,15 +294,7 @@ export default function App() {
             />
           )}
           {activeTab === 'charts' && (
-            <ChartsTab
-              theme={theme}
-              sessionId={sessionId}
-              selectedAccount={selectedAccount}
-              currency={currency}
-              onBalanceUpdate={setBalance}
-              onTradeSettled={(trade) => setTrades((prev) => [...prev, trade])}
-              onRequireAuth={() => setAuthModal(true)}
-            />
+            <ChartsTab theme={theme} />
           )}
           {activeTab === 'circles' && (
             <CirclesTab
@@ -867,10 +859,7 @@ const CHART_GRANS = [
   { value: 3600, label: '1h' },
 ];
 
-function ChartsTab({
-  theme, sessionId, selectedAccount, currency,
-  onBalanceUpdate, onTradeSettled, onRequireAuth,
-}) {
+function ChartsTab({ theme }) {
   const [symbols, setSymbols] = useState([]);
   const [symbol, setSymbol] = useState(null);
   const [granularity, setGranularity] = useState(60);
@@ -883,31 +872,10 @@ function ChartsTab({
   const [wsStatus, setWsStatus] = useState('connecting');
   const [refreshKey, setRefreshKey] = useState(0);
 
-  // ---- Deriv-style Rise/Fall trade panel ----
-  const [stake, setStake] = useState(1);
-  const [duration, setDuration] = useState(5);
-  const [durationUnit, setDurationUnit] = useState('t');
-  const [riseProposal, setRiseProposal] = useState(null);
-  const [fallProposal, setFallProposal] = useState(null);
-  const [proposalError, setProposalError] = useState(null);
-  const [buying, setBuying] = useState(null); // 'RISE' | 'FALL' | null
-  const [contract, setContract] = useState(null); // latest proposal_open_contract
-  const [contractMeta, setContractMeta] = useState(null); // buy response + meta
-  const [selling, setSelling] = useState(false);
-  const [tradeError, setTradeError] = useState(null);
-  const [result, setResult] = useState(null);
-  const [now, setNow] = useState(Date.now());
-
   const wsRef = useRef(null);
-  const settleRef = useRef(null);
-  const contractMetaRef = useRef(null);
-  const contractIdRef = useRef(null);
-  useEffect(() => { contractMetaRef.current = contractMeta; }, [contractMeta]);
-  useEffect(() => { contractIdRef.current = contractMeta?.contract_id ?? null; }, [contractMeta]);
 
   const activeSymbol = symbols.find((s) => s.symbol === symbol) || null;
   const decimals = activeSymbol?.decimals ?? 2;
-  const loggedIn = !!(sessionId && selectedAccount);
 
   useEffect(() => {
     let cancelled = false;
@@ -948,54 +916,18 @@ function ChartsTab({
     return () => { cancelled = true; };
   }, [symbol, granularity, refreshKey]);
 
-  // reset any open trade state when the symbol changes
-  useEffect(() => {
-    setContract(null);
-    setContractMeta(null);
-    setResult(null);
-    setTradeError(null);
-    settleRef.current = null;
-  }, [symbol]);
-
-  const applyContract = (poc) => {
-    if (poc.is_sold || poc.status === 'sold') {
-      if (settleRef.current === poc.contract_id) return;
-      settleRef.current = poc.contract_id;
-      const meta = contractMetaRef.current || {};
-      const profit = poc.profit ?? 0;
-      setResult({ won: profit >= 0, profit, soldEarly: false });
-      setContract(null);
-      setContractMeta(null);
-      onTradeSettled && onTradeSettled({ id: poc.contract_id, symbol, direction: meta.contract_type, stake: meta.price ?? 0, profit, won: profit >= 0, ts: Date.now() });
-      refreshBalance();
-      return;
-    }
-    setContract(poc);
-  };
-
-  async function refreshBalance() {
-    if (!sessionId || !selectedAccount) return;
-    try {
-      const res = await fetch(`${API_BASE}/api/balance?session=${sessionId}&account=${selectedAccount}`);
-      if (res.ok && onBalanceUpdate) onBalanceUpdate(await res.json());
-    } catch { /* keep last known balance */ }
-  }
-
-  // live ticks append to the same line, plus balance/contract updates when logged in
+  // live ticks append to the same line
   useEffect(() => {
     if (!symbol) return;
     let ws = null;
     let closed = false;
     let retry = 0;
     let retryTimer = null;
-    const authed = !!(sessionId && selectedAccount);
 
     const connect = () => {
       if (closed) return;
       setWsStatus('connecting');
-      const url = authed
-        ? `${WS_BASE}/ws?symbol=${encodeURIComponent(symbol)}&session=${encodeURIComponent(sessionId)}&account=${encodeURIComponent(selectedAccount)}`
-        : `${WS_BASE}/ws?symbol=${encodeURIComponent(symbol)}`;
+      const url = `${WS_BASE}/ws?symbol=${encodeURIComponent(symbol)}`;
       try {
         ws = new WebSocket(url);
       } catch {
@@ -1007,10 +939,6 @@ function ChartsTab({
       ws.onopen = () => {
         retry = 0;
         setWsStatus('live');
-        if (authed) {
-          ws.send(JSON.stringify({ action: 'subscribe', balance: true }));
-          if (contractIdRef.current) ws.send(JSON.stringify({ action: 'subscribe', contract: contractIdRef.current }));
-        }
       };
       ws.onmessage = (e) => {
         try {
@@ -1019,8 +947,6 @@ function ChartsTab({
             setMarketStatus(msg);
             return;
           }
-          if (msg.msg_type === 'balance' && msg.balance) { onBalanceUpdate && onBalanceUpdate(msg.balance); return; }
-          if (msg.msg_type === 'proposal_open_contract' && msg.proposal_open_contract) { applyContract(msg.proposal_open_contract); return; }
           if (msg.msg_type !== 'tick' || !msg.tick) return;
           const { epoch, quote } = msg.tick;
           setPoints((prev) => {
@@ -1059,125 +985,7 @@ function ChartsTab({
       try { if (ws) ws.close(); } catch { /* noop */ }
       wsRef.current = null;
     };
-  }, [symbol, granularity, sessionId, selectedAccount]);
-
-  // subscribe/unsubscribe the open-contract stream on the same socket
-  useEffect(() => {
-    const ws = wsRef.current;
-    const contractId = contractMeta?.contract_id;
-    if (!ws || !contractId) return;
-    ws.send(JSON.stringify({ action: 'subscribe', contract: contractId }));
-    return () => {
-      try {
-        if (wsRef.current && wsRef.current.readyState === 1) {
-          wsRef.current.send(JSON.stringify({ action: 'unsubscribe', contract: contractId }));
-        }
-      } catch { /* noop */ }
-    };
-  }, [contractMeta?.contract_id]);
-
-  // countdown clock for the open-contract timer
-  useEffect(() => {
-    const id = setInterval(() => setNow(Date.now()), 250);
-    return () => clearInterval(id);
-  }, []);
-
-  // Rise/Fall payout quotes, refreshed while no contract is open
-  useEffect(() => {
-    if (!sessionId || !selectedAccount || !symbol || contractMeta) { setRiseProposal(null); setFallProposal(null); return; }
-    let cancelled = false;
-    setProposalError(null);
-    const t = setTimeout(() => {
-      const fetchOne = (type) => fetch(`${API_BASE}/api/contract/proposal`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          session: sessionId,
-          account: selectedAccount,
-          symbol,
-          contract_type: type,
-          amount: stake,
-          basis: 'stake',
-          duration,
-          duration_unit: durationUnit,
-          currency,
-        }),
-      }).then(async (r) => {
-        const data = await r.json();
-        if (!r.ok) throw new Error(data.error || 'Proposal failed');
-        return data.proposal;
-      });
-      Promise.all([fetchOne('RISE'), fetchOne('FALL')])
-        .then(([rise, fall]) => { if (!cancelled) { setRiseProposal(rise); setFallProposal(fall); setProposalError(null); } })
-        .catch((e) => { if (!cancelled) { setRiseProposal(null); setFallProposal(null); setProposalError(e.message); } });
-    }, 300);
-    return () => { cancelled = true; clearTimeout(t); };
-  }, [sessionId, selectedAccount, symbol, stake, duration, durationUnit, currency, contractMeta]);
-
-  async function handleBuy(type) {
-    if (!sessionId || !selectedAccount) { onRequireAuth && onRequireAuth(); return; }
-    const proposal = type === 'RISE' ? riseProposal : fallProposal;
-    if (!proposal || buying || contractMeta) return;
-    setBuying(type);
-    setTradeError(null);
-    setResult(null);
-    try {
-      const res = await fetch(`${API_BASE}/api/contract/buy`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ session: sessionId, account: selectedAccount, proposal_id: proposal.id, price: proposal.ask_price }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Buy failed');
-      const buy = data.buy;
-      settleRef.current = null;
-      setContractMeta({
-        ...buy,
-        contract_type: type,
-        symbol,
-        duration,
-        duration_unit: durationUnit,
-        date_expiry: proposal.date_expiry,
-        tick_count: proposal.tick_count,
-        payout: proposal.payout,
-        longcode: proposal.longcode,
-      });
-      setContract(null);
-      refreshBalance();
-    } catch (e) {
-      setTradeError(e.message);
-    } finally {
-      setBuying(null);
-    }
-  }
-
-  async function handleSell() {
-    if (!contract || !contract.is_valid_to_sell || selling) return;
-    setSelling(true);
-    setTradeError(null);
-    try {
-      const res = await fetch(`${API_BASE}/api/contract/sell`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ session: sessionId, account: selectedAccount, contract_id: contract.contract_id, price: contract.sell_price }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Sell failed');
-      const sold = data.sell;
-      const buyPrice = contractMeta?.price ?? 0;
-      const profit = (sold.sold_for ?? contract.sell_price) - buyPrice;
-      settleRef.current = contract.contract_id;
-      setResult({ won: profit >= 0, profit, soldEarly: true, soldFor: sold.sold_for });
-      setContract(null);
-      setContractMeta(null);
-      onTradeSettled && onTradeSettled({ id: contract.contract_id, symbol, direction: contractMeta?.contract_type, stake: buyPrice, profit, won: profit >= 0, ts: Date.now() });
-      refreshBalance();
-    } catch (e) {
-      setTradeError(e.message);
-    } finally {
-      setSelling(false);
-    }
-  }
+  }, [symbol, granularity]);
 
   const marketNotice = marketStatus
     ? (marketStatus.marketClosed
@@ -1192,27 +1000,6 @@ function ChartsTab({
   const up = last != null && first != null && last >= first;
   const statusLabel = wsStatus === 'live' ? 'Live' : wsStatus === 'connecting' ? 'Connecting' : 'Offline';
   const statusClass = wsStatus === 'live' ? 'tv-live' : wsStatus === 'connecting' ? 'tv-connecting' : 'tv-offline';
-
-  const isTickContract = (contractMeta?.duration_unit ?? durationUnit) === 't';
-  const contractEndMs = (() => {
-    const expiry = contract?.date_expiry ?? contractMeta?.date_expiry;
-    if (expiry) return expiry * 1000;
-    if (contractMeta?.purchase_time && !isTickContract) {
-      const secs = MT_UNIT_SECONDS[contractMeta.duration_unit] || MT_UNIT_SECONDS.m;
-      return (contractMeta.purchase_time + contractMeta.duration * secs) * 1000;
-    }
-    return null;
-  })();
-  const remainingMs = contractEndMs ? Math.max(0, contractEndMs - now) : null;
-  const totalTicks = contractMeta?.tick_count;
-  const currentTick = contract?.current_tick;
-  const remainingTicks = (totalTicks != null && currentTick != null) ? Math.max(0, totalTicks - currentTick) : null;
-
-  const livePrice = contract?.current_spot ?? last;
-  const entryPoint = contract?.entry_spot != null
-    ? { price: contract.entry_spot, time: contract.entry_tick_time }
-    : (contractMeta?.entry_spot != null ? { price: contractMeta.entry_spot, time: contractMeta.entry_tick_time } : null);
-  const hasOpenContract = !!contractMeta;
 
   return (
     <div className="section">
@@ -1289,122 +1076,9 @@ function ChartsTab({
             candles={candles}
             chartType={chartType}
             decimals={decimals}
-            entryPoint={entryPoint}
-            lastPrice={livePrice ?? undefined}
-            direction={contractMeta?.contract_type}
             theme={theme}
           />
         </div>
-      </div>
-
-      <div className="deriv-trade-panel">
-        <div className="dtp-row">
-          <label className="dtp-field">
-            <span>Stake ({currency || 'USD'})</span>
-            <input
-              className="dtp-input"
-              type="number"
-              min="0.35"
-              step="0.01"
-              value={stake}
-              onChange={(e) => setStake(Number(e.target.value))}
-              disabled={hasOpenContract}
-            />
-          </label>
-          <label className="dtp-field">
-            <span>Duration</span>
-            <div className="dtp-duration-row">
-              <input
-                className="dtp-input dtp-duration-input"
-                type="number"
-                min="1"
-                value={duration}
-                onChange={(e) => setDuration(Number(e.target.value))}
-                disabled={hasOpenContract}
-              />
-              <div className="dtp-unit-toggle">
-                {['t', 'm'].map((u) => (
-                  <button
-                    key={u}
-                    className={`dtp-unit-btn ${durationUnit === u ? 'dtp-unit-active' : ''}`}
-                    onClick={() => setDurationUnit(u)}
-                    disabled={hasOpenContract}
-                  >
-                    {MT_UNIT_LABELS[u]}
-                  </button>
-                ))}
-              </div>
-            </div>
-          </label>
-        </div>
-
-        {!loggedIn && (
-          <div className="dtp-hint">
-            <AlertTriangle size={13} /> Log in with your Deriv account to trade this chart live.
-          </div>
-        )}
-        {loggedIn && proposalError && !hasOpenContract && (
-          <div className="dtp-error"><AlertTriangle size={13} /> {proposalError}</div>
-        )}
-        {tradeError && (
-          <div className="dtp-error"><AlertTriangle size={13} /> {tradeError}</div>
-        )}
-
-        {!hasOpenContract && (
-          <div className="dtp-buttons">
-            <button
-              className="dtp-btn dtp-rise"
-              disabled={loggedIn && (!riseProposal || !!buying)}
-              onClick={() => (loggedIn ? handleBuy('RISE') : onRequireAuth && onRequireAuth())}
-            >
-              <TrendingUp size={20} />
-              <span className="dtp-label">Rise</span>
-              <span className="dtp-payout">
-                {buying === 'RISE' ? 'Buying…' : riseProposal ? `Payout ${riseProposal.payout.toFixed(2)} ${currency || ''}` : '—'}
-              </span>
-            </button>
-            <button
-              className="dtp-btn dtp-fall"
-              disabled={loggedIn && (!fallProposal || !!buying)}
-              onClick={() => (loggedIn ? handleBuy('FALL') : onRequireAuth && onRequireAuth())}
-            >
-              <TrendingDown size={20} />
-              <span className="dtp-label">Fall</span>
-              <span className="dtp-payout">
-                {buying === 'FALL' ? 'Buying…' : fallProposal ? `Payout ${fallProposal.payout.toFixed(2)} ${currency || ''}` : '—'}
-              </span>
-            </button>
-          </div>
-        )}
-
-        {hasOpenContract && (
-          <div className="dtp-open">
-            <div className="dtp-open-top">
-              <span className={`dtp-open-badge ${contractMeta.contract_type === 'RISE' ? 'dtp-badge-up' : 'dtp-badge-down'}`}>
-                {contractMeta.contract_type === 'RISE' ? <TrendingUp size={13} /> : <TrendingDown size={13} />}
-                {contractMeta.contract_type === 'RISE' ? 'Rise' : 'Fall'}
-              </span>
-              {isTickContract
-                ? <span className="dtp-timer">⏱ {remainingTicks == null ? '—' : `${remainingTicks} ticks left`}</span>
-                : <span className="dtp-timer">⏱ {formatRemaining(remainingMs)} left</span>}
-            </div>
-            <div className="dtp-open-rows">
-              <div className="dtp-open-row"><span>Entry</span><b>{entryPoint ? entryPoint.price.toFixed(decimals) : '—'}</b></div>
-              <div className="dtp-open-row"><span>Current</span><b>{livePrice != null ? livePrice.toFixed(decimals) : '—'}</b></div>
-              <div className="dtp-open-row"><span>Sell now at</span><b>{contract?.sell_price != null ? contract.sell_price.toFixed(2) : '—'}</b></div>
-            </div>
-            <button className="dtp-btn dtp-sell" onClick={handleSell} disabled={!(contract && contract.is_valid_to_sell) || selling}>
-              {selling ? 'Selling…' : 'Sell now'}
-            </button>
-          </div>
-        )}
-
-        {result && (
-          <div className={`dtp-result ${result.won ? 'dtp-result-won' : 'dtp-result-lost'}`}>
-            <b>{result.soldEarly ? (result.won ? 'Closed at a profit' : 'Closed at a loss') : (result.won ? 'Contract won' : 'Contract lost')}</b>
-            <span>{result.profit >= 0 ? '+' : ''}{result.profit.toFixed(2)} {currency || ''}</span>
-          </div>
-        )}
       </div>
     </div>
   );
@@ -2728,7 +2402,7 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
           </select>
 
           <label className="card-label">Symbol</label>
-          <select className="select" value={symbol || ''} onChange={(e) => { setSymbol(e.target.value); setContract(null); setContractMeta(null); setResult(null); }} disabled={symbols.length === 0}>
+          <select className="select" value={symbol || ''} onChange={(e) => { setSymbol(e.target.value); setContract(null); setContractMeta(null); setResult(null); setTicks([]); setLastTick(null); }} disabled={symbols.length === 0}>
             {symbol === null && <option value="">Loading symbols…</option>}
             {Object.entries(
               symbols.reduce((groups, s) => {
@@ -3235,7 +2909,9 @@ function CandleFeedChart({ candles, decimals, entryPoint, lastPrice, direction, 
     const prev = appliedLen.current;
     if (prev === 0 || prev > candles.length || candles.length > prev + 1) {
       series.setData(candles.map(toBar));
-    } else if (prev < candles.length) {
+    } else {
+      // Either a new candle was appended, or the forming candle moved in
+      // place (more ticks landed in the current second) — update the last bar.
       series.update(toBar(candles[candles.length - 1]));
     }
     appliedLen.current = candles.length;
@@ -3881,41 +3557,6 @@ function GlobalStyle() {
       .chart-toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
       .chart-symbol-select { width: 320px; max-width: 100%; }
       .chart-canvas { position: relative; }
-
-      .deriv-trade-panel { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 14px; margin-top: 14px; display: flex; flex-direction: column; gap: 12px; max-width: 640px; }
-      .dtp-row { display: flex; gap: 14px; flex-wrap: wrap; }
-      .dtp-field { display: flex; flex-direction: column; gap: 6px; font-size: 12px; color: var(--text-muted); flex: 1; min-width: 140px; }
-      .dtp-input { background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; color: var(--text); font-size: 13px; width: 100%; }
-      .dtp-duration-row { display: flex; gap: 6px; }
-      .dtp-duration-input { flex: 0 0 80px; }
-      .dtp-unit-toggle { display: flex; gap: 4px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; padding: 3px; }
-      .dtp-unit-btn { background: transparent; border: none; color: var(--text-muted); padding: 6px 10px; border-radius: 6px; font-size: 12px; font-weight: 600; cursor: pointer; }
-      .dtp-unit-active { background: var(--panel); color: var(--text); }
-      .dtp-hint { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-muted); background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; }
-      .dtp-error { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--accent-red); background: rgba(255,68,79,0.1); border-radius: 8px; padding: 8px 10px; }
-      .dtp-buttons { display: flex; gap: 10px; }
-      .dtp-btn { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; border: none; border-radius: 10px; padding: 14px 10px; font-weight: 700; font-size: 14px; cursor: pointer; transition: filter 0.15s ease; }
-      .dtp-btn:disabled { opacity: 0.55; cursor: not-allowed; }
-      .dtp-btn:not(:disabled):hover { filter: brightness(1.08); }
-      .dtp-rise { background: var(--accent-teal); color: #fff; }
-      .dtp-fall { background: var(--accent-red); color: #fff; }
-      .dtp-label { font-size: 15px; letter-spacing: 0.02em; }
-      .dtp-payout { font-size: 12px; font-weight: 600; opacity: 0.92; font-family: 'SFMono-Regular', Consolas, monospace; }
-      .dtp-open { display: flex; flex-direction: column; gap: 10px; border: 1px solid var(--border); background: var(--panel-2); border-radius: 10px; padding: 12px; }
-      .dtp-open-top { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
-      .dtp-open-badge { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; font-weight: 700; padding: 5px 10px; border-radius: 999px; }
-      .dtp-badge-up { color: var(--accent-teal); background: rgba(0,208,160,0.12); }
-      .dtp-badge-down { color: var(--accent-red); background: rgba(255,68,79,0.12); }
-      .dtp-timer { font-size: 13px; font-weight: 700; color: var(--accent-indigo); font-family: 'SFMono-Regular', Consolas, monospace; }
-      .dtp-open-rows { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
-      .dtp-open-row { display: flex; flex-direction: column; gap: 2px; font-size: 12px; }
-      .dtp-open-row span { color: var(--text-muted); }
-      .dtp-open-row b { font-family: 'SFMono-Regular', Consolas, monospace; font-size: 13px; }
-      .dtp-sell { background: var(--accent-red); color: #fff; }
-      .dtp-result { display: flex; justify-content: space-between; align-items: center; border-radius: 10px; padding: 10px 12px; font-size: 13px; }
-      .dtp-result-won { background: rgba(0,208,160,0.12); color: var(--accent-teal); }
-      .dtp-result-lost { background: rgba(255,68,79,0.12); color: var(--accent-red); }
-      @media (max-width: 480px) { .dtp-open-rows { grid-template-columns: 1fr; } .dtp-buttons { flex-direction: column; } }
 
       .sidebar-ledger { width: 100%; display: flex; flex-direction: column; gap: 4px; overflow-y: auto; max-height: 280px; }
       .ledger-row { display: grid; grid-template-columns: 60px minmax(0, 1fr) auto; gap: 8px; align-items: center; background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; font-size: 12px; }
