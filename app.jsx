@@ -1,9 +1,11 @@
 import { useEffect, useRef, useState, useMemo } from 'react';
 import {
   Play, LayoutGrid, Wrench, LineChart as ChartIcon, Users, Gift,
-  Brain, Copy as CopyIcon, User, X, RotateCcw, TrendingUp, TrendingDown,
+  Brain, Copy as CopyIcon, User, X, TrendingUp, TrendingDown,
   GraduationCap, Calculator, BookOpen, Radio, Activity,
   RefreshCw, AlertTriangle, Moon, Sun, Monitor, Wallet,
+  Search, Trophy, SlidersHorizontal, Check,
+  Shield, Zap, Eye, PlayCircle,
 } from 'lucide-react';
 import { createChart, AreaSeries, CandlestickSeries, ColorType, CrosshairMode, LineStyle, createSeriesMarkers } from 'lightweight-charts';
 import ClassesTab from './tabs/classes.jsx';
@@ -73,7 +75,6 @@ const PROMOS = [
 export default function App() {
   const [activeTab, setActiveTab] = useState('dashboard');
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [sidebarTab, setSidebarTab] = useState('summary');
   const [authModal, setAuthModal] = useState(false);
   const [cashierModal, setCashierModal] = useState(null); // { mode: 'deposit' | 'withdraw' }
 
@@ -95,11 +96,7 @@ export default function App() {
   const [authError, setAuthError] = useState(null);
 
   // --- Bot run state ---
-  const [botRunning, setBotRunning] = useState(false);
-  const [openContracts, setOpenContracts] = useState([]);
-  const [trades, setTrades] = useState([]);
   const [pendingBotXml, setPendingBotXml] = useState(null);
-  const intervalRef = useRef(null);
   const [balanceKey, setBalanceKey] = useState(0);
 
   useEffect(() => {
@@ -167,55 +164,15 @@ export default function App() {
     setBalance(null);
   }
 
-  // Run toggles LIVE monitoring of open contracts on the selected account.
-  // The ledger (stats below) is fed by real contract results from the
-  // Manual Trader tab — no simulated numbers.
-  async function fetchOpenContracts() {
-    if (!sessionId || !selectedAccount) return;
-    try {
-      const res = await fetch(`${API_BASE}/api/contract/open?session=${sessionId}&account=${selectedAccount}`);
-      if (!res.ok) return;
-      const data = await res.json();
-      setOpenContracts(data.contracts || []);
-    } catch { /* keep last known list */ }
-  }
-
-  function toggleBot() {
-    if (botRunning) {
-      clearInterval(intervalRef.current);
-      setBotRunning(false);
-      return;
-    }
-    setBotRunning(true);
-    fetchOpenContracts();
-    intervalRef.current = setInterval(fetchOpenContracts, 3000);
-  }
-
-  // Open the run-bot panel. Logged-in users get the big modal; guests get the
-  // log in / sign up modal instead (they can't run the bot unauthenticated).
+  // Open the quick-trade panel from the floating run button.
   function openBotPanel() {
-    if (!sessionId) { setAuthModal(true); return; }
     setSidebarOpen((v) => !v);
-  }
-
-  // The Run/Stop button inside the panel is also gated so a stale guest session
-  // can never start monitoring.
-  function handleRunBot() {
-    if (!sessionId) { setAuthModal(true); return; }
-    toggleBot();
   }
 
   // Open the Deriv cashier (deposit/withdraw). Guests are sent to the auth modal.
   function openCashier(mode) {
     if (!sessionId) { setAuthModal(true); return; }
     setCashierModal({ mode: mode === 'withdraw' ? 'withdraw' : 'deposit' });
-  }
-
-  function resetStats() {
-    clearInterval(intervalRef.current);
-    setBotRunning(false);
-    setOpenContracts([]);
-    setTrades([]);
   }
 
   function handleUseBot(xml) {
@@ -234,16 +191,29 @@ export default function App() {
     } catch { /* activity logging is best-effort */ }
   }
 
-  useEffect(() => () => clearInterval(intervalRef.current), []);
+  // Persist a settled trade to the per-day history DB so the dashboard can
+  // show daily profit/loss. Fire-and-forget; failures are non-fatal.
+  function recordTrade(t) {
+    if (!sessionId || !selectedAccount) return;
+    const payload = {
+      session: sessionId,
+      account: selectedAccount,
+      symbol: t.symbol,
+      contract_type: t.direction,
+      stake: t.stake,
+      profit: t.profit,
+      payout: t.payout || 0,
+      status: t.won ? 'won' : 'lost',
+      source: t.source || 'manual',
+    };
+    fetch(`${API_BASE}/api/trades/record`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }).catch(() => { /* best-effort */ });
+    logActivity(t.won ? 'trade_win' : 'trade_loss', { symbol: t.symbol, profit: t.profit });
+  }
 
-  const stats = trades.reduce((acc, t) => {
-    acc.totalStake += t.stake;
-    if (t.won) { acc.won += 1; acc.totalPayout += t.stake + t.profit; }
-    else { acc.lost += 1; }
-    acc.runs += 1;
-    return acc;
-  }, { totalStake: 0, totalPayout: 0, runs: 0, won: 0, lost: 0 });
-  const profitLoss = +(stats.totalPayout - stats.totalStake).toFixed(2);
   const currency = accounts.find((a) => a.account === selectedAccount)?.currency || 'USD';
 
   return (
@@ -256,7 +226,6 @@ export default function App() {
         loggedIn={!!sessionId}
         onLogin={handleLogin}
         onLogout={handleLogout}
-        onOpenBotPanel={openBotPanel}
         onOpenCashier={openCashier}
         theme={theme}
         setTheme={setTheme}
@@ -287,7 +256,6 @@ export default function App() {
               currency={currency}
               balance={balance}
               onBalanceUpdate={setBalance}
-              onTradeSettled={(trade) => setTrades((prev) => [...prev, trade])}
               onRequireAuth={() => setAuthModal(true)}
               initialXml={pendingBotXml}
               onActivity={(type, detail) => logActivity(type, detail)}
@@ -334,8 +302,9 @@ export default function App() {
               balance={balance}
               onBalanceUpdate={setBalance}
               currency={currency}
-              onTradeSettled={(trade) => setTrades((prev) => [...prev, trade])}
               theme={theme}
+              onLogin={handleLogin}
+              onTradeSettled={recordTrade}
             />
           )}
           {activeTab === 'classes' && <ClassesTab />}
@@ -344,19 +313,27 @@ export default function App() {
         </main>
 
         {sidebarOpen && (
-          <BotSidebar
-            sidebarTab={sidebarTab}
-            setSidebarTab={setSidebarTab}
-            botRunning={botRunning}
-            toggleBot={handleRunBot}
-            resetStats={resetStats}
-            stats={stats}
-            profitLoss={profitLoss}
-            currency={currency}
-            openContracts={openContracts}
-            trades={trades}
-            onClose={() => setSidebarOpen(false)}
-          />
+          <div className="modal-overlay" onClick={() => setSidebarOpen(false)}>
+            <div className="bot-modal trade-modal" role="dialog" aria-modal="true" onClick={(e) => e.stopPropagation()}>
+              <div className="sidebar-topbar">
+                <div className="modal-title">Manual Trader</div>
+                <button className="btn-icon" onClick={() => setSidebarOpen(false)} aria-label="Close"><X size={16} /></button>
+              </div>
+              <ManualTraderTab
+                sessionId={sessionId}
+                accounts={accounts}
+                selectedAccount={selectedAccount}
+                setSelectedAccount={setSelectedAccount}
+                balance={balance}
+                onBalanceUpdate={setBalance}
+                currency={currency}
+                theme={theme}
+                onLogin={handleLogin}
+                onTradeSettled={recordTrade}
+                embedded
+              />
+            </div>
+          </div>
         )}
         {authModal && (
           <AuthModal
@@ -549,7 +526,7 @@ const THEME_OPTIONS = [
   { id: 'system', label: 'System', icon: Monitor },
 ];
 
-function TopNav({ activeTab, setActiveTab, loggedIn, onLogin, onLogout, onOpenBotPanel, onOpenCashier, theme, setTheme }) {
+function TopNav({ activeTab, setActiveTab, loggedIn, onLogin, onLogout, onOpenCashier, theme, setTheme }) {
   const [themeOpen, setThemeOpen] = useState(false);
   const themeRef = useRef(null);
 
@@ -615,13 +592,6 @@ function TopNav({ activeTab, setActiveTab, loggedIn, onLogin, onLogout, onOpenBo
             onClick={() => onOpenCashier && onOpenCashier('deposit')}
           >
             <Wallet size={16} />
-          </button>
-          <button
-            className="btn-icon"
-            title="Run bot"
-            onClick={onOpenBotPanel}
-          >
-            <Wrench size={16} />
           </button>
         </div>
       </div>
@@ -751,35 +721,50 @@ function CampaignsTab() {
 
 // ---------------- Dashboard ----------------
 
-const ACTIVITY_LABELS = {
-  login: 'Logged in',
-  deposit: 'Opened the Deriv cashier (deposit)',
-  withdraw: 'Opened the Deriv cashier (withdraw)',
-  bot_run: 'Ran a bot',
-  bot_share: 'Shared a bot',
-  bot_upload_free: 'Uploaded a free bot',
-  bot_use: 'Used a community bot',
-  circle_create: 'Created a PCircle',
-  circle_join: 'Joined a PCircle',
-  circle_leave: 'Left a PCircle',
-  copy_strategy_create: 'Published a copy-trading strategy',
-  copy_follow: 'Started following a strategy',
-  copy_unfollow: 'Stopped following a strategy',
-};
-
 function DashboardTab({ loggedIn, sessionId, accounts, selectedAccount, setSelectedAccount, balance, onLogin, onOpenCashier }) {
-  const [activity, setActivity] = useState([]);
+  const [history, setHistory] = useState(null);
+  const [historyBusy, setHistoryBusy] = useState(false);
+  const [days, setDays] = useState(7);
+
+  const currency = accounts.find((a) => a.account === selectedAccount)?.currency || 'USD';
+
+  const today = (() => {
+    const t = new Date();
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${t.getFullYear()}-${pad(t.getMonth() + 1)}-${pad(t.getDate())}`;
+  })();
 
   useEffect(() => {
-    if (!loggedIn || !selectedAccount) { setActivity([]); return; }
+    if (!loggedIn || !sessionId || !selectedAccount) { setHistory(null); return; }
     let cancelled = false;
-    fetch(`${API_BASE}/api/activity?session=${encodeURIComponent(sessionId)}&account=${encodeURIComponent(selectedAccount)}`)
-      .then((r) => (r.ok ? r.json() : Promise.reject(new Error('activity failed'))))
-      .then((data) => { if (!cancelled) setActivity(data.activities || []); })
-      .catch(() => { if (!cancelled) setActivity([]); });
+    setHistoryBusy(true);
+    fetch(`${API_BASE}/api/trades/history?days=${days}&session=${encodeURIComponent(sessionId)}&account=${encodeURIComponent(selectedAccount)}`)
+      .then((r) => (r.ok ? r.json() : Promise.reject()))
+      .then((data) => { if (!cancelled) setHistory(data); })
+      .catch(() => { if (!cancelled) setHistory(null); })
+      .finally(() => { if (!cancelled) setHistoryBusy(false); });
     return () => { cancelled = true; };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [loggedIn, selectedAccount]);
+  }, [loggedIn, sessionId, selectedAccount, days]);
+
+  const fmtMoney = (n) => {
+    const v = Number(n);
+    if (!Number.isFinite(v)) return '0';
+    const sign = v > 0 ? '+' : '';
+    return `${sign}${v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  };
+  const fmtDay = (s) => {
+    if (!s) return '—';
+    const parts = String(s).split('-').map(Number);
+    if (parts.length !== 3 || !parts[0]) return s;
+    const dt = new Date(parts[0], parts[1] - 1, parts[2]);
+    const label = dt.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
+    return s === today ? `${label} · today` : label;
+  };
+
+  const todays = (history?.days || []).find((d) => d.day === today) || null;
+  const periodTotal = (history?.days || []).reduce((a, d) => a + d.total, 0);
+  const periodNet = (history?.days || []).reduce((a, d) => a + d.net, 0);
+  const todaysWinRate = todays && todays.total > 0 ? Math.round((todays.wins / todays.total) * 100) : null;
 
   return (
     <div className="section">
@@ -822,23 +807,85 @@ function DashboardTab({ loggedIn, sessionId, accounts, selectedAccount, setSelec
             </div>
           </div>
 
-          <div className="card" style={{ marginTop: 14 }}>
-            <div className="card-label">Recent activity</div>
-            {activity.length === 0 ? (
-              <p style={{ color: 'var(--text-muted)', fontSize: 13, margin: '10px 0 0' }}>
-                No activity yet — run a bot, share one, join a PCircle or publish a copy strategy and it will show up here.
-              </p>
-            ) : (
-              <div className="activity-list">
-                {activity.map((a, i) => (
-                  <div className="activity-row" key={i}>
-                    <span className={`activity-dot activity-dot-${a.type}`} />
-                    <span className="activity-msg">{ACTIVITY_LABELS[a.type] || a.type}</span>
-                    <span className="activity-time">{new Date(a.created_at).toLocaleString()}</span>
+          <div className="dash-trades">
+            <div className="dash-trades-head">
+              <span className="card-label">Trading history</span>
+              <select className="select" value={days} onChange={(e) => setDays(Number(e.target.value))}>
+                <option value={7}>Last 7 days</option>
+                <option value={14}>Last 14 days</option>
+                <option value={30}>Last 30 days</option>
+              </select>
+            </div>
+
+            {historyBusy && <div className="mt-hint">Loading history…</div>}
+            {!historyBusy && history && (
+              <>
+                <div className="dash-stats">
+                  <div className="stat-card">
+                    <span className="stat-label">Today · profit</span>
+                    <b className="roi-up">{fmtMoney(todays ? todays.winAmount : 0)} {currency}</b>
+                    <span className="stat-sub">{todays ? todays.wins : 0} winning trades</span>
                   </div>
-                ))}
-              </div>
+                  <div className="stat-card">
+                    <span className="stat-label">Today · loss</span>
+                    <b className="roi-down">{fmtMoney(-(todays ? todays.lossAmount : 0))} {currency}</b>
+                    <span className="stat-sub">{todays ? todays.losses : 0} losing trades</span>
+                  </div>
+                  <div className="stat-card stat-card-net">
+                    <span className="stat-label">Today · net P/L</span>
+                    <b className={(todays ? todays.net : 0) >= 0 ? 'roi-up' : 'roi-down'}>{fmtMoney(todays ? todays.net : 0)} {currency}</b>
+                    <span className="stat-sub">win rate {todaysWinRate == null ? '—' : `${todaysWinRate}%`}</span>
+                  </div>
+                  <div className="stat-card">
+                    <span className="stat-label">Period · net P/L</span>
+                    <b className={periodNet >= 0 ? 'roi-up' : 'roi-down'}>{fmtMoney(periodNet)} {currency}</b>
+                    <span className="stat-sub">{periodTotal} trades in {days} days</span>
+                  </div>
+                </div>
+
+                <div className="table-card">
+                  <div className="table-row table-head table-row-5">
+                    <span>Day</span><span>Trades</span><span>Wins</span><span>Losses</span><span>Net P/L</span>
+                  </div>
+                  {history.days.length === 0 && (
+                    <div className="table-row"><span className="mt-hint">No trades recorded yet — trades settle here automatically.</span></div>
+                  )}
+                  {history.days.map((d) => (
+                    <div className="table-row table-row-5" key={d.day}>
+                      <span>{fmtDay(d.day)}</span>
+                      <span>{d.total}</span>
+                      <span className="roi-up">{d.wins}</span>
+                      <span className="roi-down">{d.losses}</span>
+                      <span className={d.net >= 0 ? 'roi-up' : 'roi-down'}>{fmtMoney(d.net)} {currency}</span>
+                    </div>
+                  ))}
+                </div>
+
+                <div className="table-card">
+                  <div className="table-row table-head">
+                    <span>Recent trades</span><span>Type</span><span>Stake</span><span>Result</span>
+                  </div>
+                  {history.recent.length === 0 && (
+                    <div className="table-row"><span className="mt-hint">No recent trades.</span></div>
+                  )}
+                  {history.recent.map((tr) => (
+                    <div className="table-row" key={tr.id}>
+                      <span className="trader-cell">
+                        <span className="trader-avatar">{String(tr.symbol || '?').slice(0, 1).toUpperCase()}</span>
+                        <span>
+                          {tr.symbol}
+                          <div className="circle-desc">{new Date(tr.trade_time).toLocaleString()}</div>
+                        </span>
+                      </span>
+                      <span>{tr.contract_type || '—'}</span>
+                      <span>{fmtMoney(tr.stake)}</span>
+                      <span className={tr.profit >= 0 ? 'roi-up' : 'roi-down'}>{fmtMoney(tr.profit)} {currency}</span>
+                    </div>
+                  ))}
+                </div>
+              </>
             )}
+            {!historyBusy && !history && <div className="mt-hint">Could not load trade history.</div>}
           </div>
         </>
       )}
@@ -1727,12 +1774,41 @@ function CopytradingTab({ sessionId, selectedAccount, accounts, currency, onRequ
   const [tradeAgain, setTradeAgain] = useState('both');
   const [uploading, setUploading] = useState(false);
 
+  // Live Deriv copy trading (copy_start / copy_stop / copytrading_list /
+  // copytrading_statistics / copy_trading_list per Deriv's docs).
+  const [tab, setTab] = useState('deriv');
+  const [topTraders, setTopTraders] = useState([]);
+  const [activeCopies, setActiveCopies] = useState([]);
+  const [copyError, setCopyError] = useState(null);
+  const [copyBusy, setCopyBusy] = useState(false);
+  const [traderToken, setTraderToken] = useState('');
+  const [assetsStr, setAssetsStr] = useState('');
+  const [selTypes, setSelTypes] = useState([]);
+  const [minStake, setMinStake] = useState('');
+  const [maxStake, setMaxStake] = useState('');
+  const [stats, setStats] = useState(null);
+  const [statsFor, setStatsFor] = useState(null);
+  const [statsBusy, setStatsBusy] = useState(false);
+
+  // Community strategy search / sort.
+  const [search, setSearch] = useState('');
+  const [sortBy, setSortBy] = useState('newest');
+
+  const authParams = () => (sessionId && selectedAccount
+    ? `?session=${encodeURIComponent(sessionId)}&account=${encodeURIComponent(selectedAccount)}`
+    : '');
+  const authBody = () => ({ session: sessionId, account: selectedAccount });
+
+  const fmtMoney = (n, cur) => {
+    const v = Number(n);
+    if (!Number.isFinite(v)) return '—';
+    const sign = v > 0 ? '+' : '';
+    return `${sign}${v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ${cur || ''}`.trim();
+  };
+
   const loadStrategies = (showBusy = false) => {
     if (showBusy) setBusy(true);
-    const params = sessionId && selectedAccount
-      ? `?session=${encodeURIComponent(sessionId)}&account=${encodeURIComponent(selectedAccount)}`
-      : '';
-    fetch(`${API_BASE}/api/copy/strategies${params}`)
+    fetch(`${API_BASE}/api/copy/strategies${authParams()}`)
       .then((r) => r.json())
       .then((data) => {
         if (data.strategies) setStrategies(data.strategies);
@@ -1743,13 +1819,26 @@ function CopytradingTab({ sessionId, selectedAccount, accounts, currency, onRequ
   };
   const loadFollows = () => {
     if (!sessionId || !selectedAccount) { setFollows(new Set()); return; }
-    fetch(`${API_BASE}/api/copy/follows?session=${encodeURIComponent(sessionId)}&account=${encodeURIComponent(selectedAccount)}`)
+    fetch(`${API_BASE}/api/copy/follows${authParams()}`)
       .then((r) => (r.ok ? r.json() : { follows: [] }))
       .then((data) => setFollows(new Set(data.follows || [])))
       .catch(() => setFollows(new Set()));
   };
 
-  useEffect(() => { loadStrategies(true); loadFollows(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [sessionId, selectedAccount]);
+  const loadDeriv = () => {
+    if (!sessionId || !selectedAccount) { setTopTraders([]); setActiveCopies([]); return; }
+    setCopyBusy(true);
+    setCopyError(null);
+    Promise.all([
+      fetch(`${API_BASE}/api/copy/top${authParams()}`).then((r) => (r.ok ? r.json() : Promise.reject(r))).then((d) => d.traders || []),
+      fetch(`${API_BASE}/api/copy/active${authParams()}`).then((r) => (r.ok ? r.json() : Promise.reject(r))).then((d) => d.list || []),
+    ])
+      .then(([traders, list]) => { setTopTraders(traders); setActiveCopies(list); })
+      .catch(async (r) => setCopyError(r && r.json ? await readApiError(r) : (r.message || 'Could not load copy trading.')))
+      .finally(() => setCopyBusy(false));
+  };
+
+  useEffect(() => { loadStrategies(true); loadFollows(); loadDeriv(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [sessionId, selectedAccount]);
   useEffect(() => {
     fetch(`${API_BASE}/api/symbols`)
       .then((r) => (r.ok ? r.json() : Promise.reject()))
@@ -1758,13 +1847,14 @@ function CopytradingTab({ sessionId, selectedAccount, accounts, currency, onRequ
   }, []);
 
   function requireAuth() { onRequireAuth && onRequireAuth(); }
+  function toastActivity(kind, data) { if (onActivity) onActivity(kind, data); }
 
   function handleFollow(s, following) {
     if (!sessionId || !selectedAccount) return requireAuth();
     fetch(`${API_BASE}/api/copy/strategies/${s.id}/follow`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ session: sessionId, account: selectedAccount, following }),
+      body: JSON.stringify({ ...authBody(), following }),
     })
       .then((r) => r.json())
       .then((data) => {
@@ -1777,7 +1867,7 @@ function CopytradingTab({ sessionId, selectedAccount, accounts, currency, onRequ
           setStrategies((prev) => prev.map((x) => (x.id === s.id
             ? { ...x, followers: Math.max(0, x.followers + (following ? 1 : -1)) }
             : x)));
-          if (onActivity) onActivity(following ? 'copy_follow' : 'copy_unfollow', { strategy_id: s.id });
+          toastActivity(following ? 'copy_follow' : 'copy_unfollow', { strategy_id: s.id });
         } else setError(data.error);
       })
       .catch((e) => setError(e.message));
@@ -1823,14 +1913,14 @@ function CopytradingTab({ sessionId, selectedAccount, accounts, currency, onRequ
     fetch(`${API_BASE}/api/copy/strategies`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ session: sessionId, account: selectedAccount, name: name.trim(), description, banner, params }),
+      body: JSON.stringify({ ...authBody(), name: name.trim(), description, banner, params }),
     })
       .then(async (r) => {
         const data = await r.json();
         if (!r.ok) throw new Error(data.error || 'Publish failed');
         setStrategies((prev) => [{ ...data.strategy, followers: 0, owned: true }, ...prev]);
         setName(''); setDescription(''); setBanner(''); setShowForm(false);
-        if (onActivity) onActivity('copy_strategy_create', { strategy_id: data.strategy.id, name: data.strategy.name });
+        toastActivity('copy_strategy_create', { strategy_id: data.strategy.id, name: data.strategy.name });
       })
       .catch((e) => setError(e.message))
       .finally(() => setUploading(false));
@@ -1842,13 +1932,13 @@ function CopytradingTab({ sessionId, selectedAccount, accounts, currency, onRequ
     fetch(`${API_BASE}/api/copy/strategies/${s.id}`, {
       method: 'DELETE',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ session: sessionId, account: selectedAccount }),
+      body: JSON.stringify(authBody()),
     })
       .then((r) => r.json())
       .then((data) => {
         if (data.ok) {
           setStrategies((prev) => prev.filter((x) => x.id !== s.id));
-          if (onActivity) onActivity('copy_strategy_delete', { strategy_id: s.id });
+          toastActivity('copy_strategy_delete', { strategy_id: s.id });
         } else setError(data.error);
       })
       .catch((e) => setError(e.message));
@@ -1865,6 +1955,103 @@ function CopytradingTab({ sessionId, selectedAccount, accounts, currency, onRequ
     return parts.join(' · ');
   }
 
+  function handleStartCopy(e) {
+    e.preventDefault();
+    if (!sessionId || !selectedAccount) return requireAuth();
+    if (!traderToken.trim()) { setCopyError('Paste the trader’s read-only API token to start copying.'); return; }
+    setCopyBusy(true);
+    setCopyError(null);
+    const body = {
+      ...authBody(),
+      token: traderToken.trim(),
+      assets: assetsStr.split(',').map((x) => x.trim().toUpperCase()).filter(Boolean),
+      trade_types: selTypes,
+      min_trade_stake: minStake ? Number(minStake) : null,
+      max_trade_stake: maxStake ? Number(maxStake) : null,
+    };
+    fetch(`${API_BASE}/api/copy/start`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+      .then(async (r) => {
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.error || 'Could not start copying');
+        setTraderToken(''); setAssetsStr(''); setSelTypes([]); setMinStake(''); setMaxStake('');
+        toastActivity('copy_start', {});
+        loadDeriv();
+      })
+      .catch((e) => setCopyError(e.message))
+      .finally(() => setCopyBusy(false));
+  }
+
+  function handleStopCopy(token) {
+    if (!sessionId || !selectedAccount) return requireAuth();
+    if (!window.confirm('Stop copying this trader?')) return;
+    setCopyBusy(true);
+    setCopyError(null);
+    fetch(`${API_BASE}/api/copy/stop`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...authBody(), token }),
+    })
+      .then(async (r) => {
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.error || 'Could not stop copying');
+        toastActivity('copy_stop', {});
+        loadDeriv();
+      })
+      .catch((e) => setCopyError(e.message))
+      .finally(() => setCopyBusy(false));
+  }
+
+  function openStats(t) {
+    if (!sessionId || !selectedAccount) return requireAuth();
+    const traderId = t.loginid || t.trader_id || t.id;
+    if (!traderId) { setCopyError('No trader id available for statistics.'); return; }
+    setStatsBusy(true);
+    setStats(null);
+    setStatsFor(t);
+    fetch(`${API_BASE}/api/copy/statistics?trader_id=${encodeURIComponent(traderId)}${authParams()}`)
+      .then(async (r) => {
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.error || 'Could not load trader statistics');
+        setStats(data.statistics || {});
+      })
+      .catch((e) => setCopyError(e.message))
+      .finally(() => setStatsBusy(false));
+  }
+
+  function toggleType(t) {
+    setSelTypes((prev) => (prev.includes(t) ? prev.filter((x) => x !== t) : [...prev, t]));
+  }
+
+  const filtered = useMemo(() => {
+    let list = [...strategies];
+    const q = search.trim().toLowerCase();
+    if (q) {
+      list = list.filter((s) =>
+        (s.name || '').toLowerCase().includes(q) ||
+        (s.description || '').toLowerCase().includes(q) ||
+        (describeParams(s.params) || '').toLowerCase().includes(q));
+    }
+    if (sortBy === 'followers') list.sort((a, b) => (b.followers || 0) - (a.followers || 0));
+    else if (sortBy === 'name') list.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+    else list.sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0));
+    return list;
+  }, [strategies, search, sortBy]);
+
+  const COPY_TYPES = ['CALL', 'PUT', 'RISE', 'FALL', 'ASIAU', 'ASIAD', 'DIGITMATCH', 'DIGITDIFF'];
+  const maskToken = (t) => (t ? `${String(t).slice(0, 4)}…${String(t).slice(-4)}` : '—');
+
+  const pickStat = (...paths) => {
+    for (const p of paths) {
+      const v = p.split('.').reduce((o, k) => (o == null ? o : o[k]), stats);
+      if (v != null) return v;
+    }
+    return null;
+  };
+
   const symbolOpts = symbols.reduce((groups, s) => {
     const key = s.market === 'synthetic_index' ? 'Synthetic Indices' : s.market === 'forex' ? 'Forex' : s.market === 'cryptocurrency' ? 'Crypto' : 'Other';
     (groups[key] = groups[key] || []).push(s);
@@ -1874,110 +2061,323 @@ function CopytradingTab({ sessionId, selectedAccount, accounts, currency, onRequ
   return (
     <div className="section">
       <h2 className="section-title">Copytrading</h2>
-      <p className="section-sub">Publish a strategy for others to copy, or follow a strategy and run it on your own account with one click.</p>
+      <p className="section-sub">Copy Deriv traders live, or publish and follow community strategies to run on your own account.</p>
 
       <div className="community-actions">
-        <button className="btn-outline btn-small" onClick={() => setShowForm((v) => !v)}>
-          {showForm ? 'Cancel' : '+ Publish a strategy'}
-        </button>
+        {[['deriv', 'Deriv traders', Trophy], ['community', 'Community strategies', Users]].map(([id, label, Icon]) => (
+          <button key={id} className={`btn-outline btn-small ${tab === id ? 'btn-active' : ''}`} onClick={() => setTab(id)}>
+            <Icon size={14} style={{ verticalAlign: -2, marginRight: 6 }} />{label}
+          </button>
+        ))}
       </div>
 
-      {showForm && (
-        <form className="booking-card community-form" onSubmit={handlePublish}>
-          <div className="booking-field">
-            <span>Strategy name</span>
-            <input className="booking-input" value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Volatility 75 Rise Runner" required />
-          </div>
-          <div className="booking-field">
-            <span>Description (optional)</span>
-            <input className="booking-input" value={description} onChange={(e) => setDescription(e.target.value)} placeholder="Rules, timeframe, risk notes…" />
-          </div>
-          <div className="booking-field">
-            <span>Banner image</span>
-            <BannerPicker banner={banner} onChange={setBanner} session={sessionId} account={selectedAccount} />
-          </div>
-          <div className="booking-row">
-            <div className="booking-field">
-              <span>Symbol</span>
-              <select className="select" value={symbol} onChange={(e) => setSymbol(e.target.value)}>
-                {symbols.length === 0 && <option value="R_75">R_75</option>}
-                {Object.entries(symbolOpts).map(([market, list]) => (
-                  <optgroup key={market} label={market}>
-                    {list.map((s) => <option key={s.symbol} value={s.symbol}>{s.symbol}</option>)}
-                  </optgroup>
-                ))}
-              </select>
+      {tab === 'deriv' && (
+        <>
+          {copyError && <div className="mt-error"><AlertTriangle size={14} style={{ verticalAlign: -2, marginRight: 6 }} />{copyError}</div>}
+          {!sessionId || !selectedAccount ? (
+            <div className="booking-card community-form">
+              <p>Log in to copy Deriv traders.</p>
+              <button className="btn-primary" onClick={requireAuth}>Log in</button>
             </div>
-            <div className="booking-field">
-              <span>Contract type</span>
-              <select className="select" value={contractType} onChange={(e) => setContractType(e.target.value)}>
-                {Object.entries(COPY_TYPE_LABELS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
-              </select>
-            </div>
-          </div>
-          <div className="booking-row">
-            <div className="booking-field">
-              <span>Stake ({currency || 'USD'})</span>
-              <input className="booking-input" type="number" min="0.01" step="0.01" value={stake} onChange={(e) => setStake(Number(e.target.value))} />
-            </div>
-            <div className="booking-field">
-              <span>Duration</span>
-              <div className="booking-row" style={{ gap: 8 }}>
-                <input className="booking-input" type="number" min="1" value={duration} onChange={(e) => setDuration(Number(e.target.value))} />
-                <select className="select" value={durationUnit} onChange={(e) => setDurationUnit(e.target.value)}>
-                  {Object.entries(COPY_UNIT_LABELS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
-                </select>
+          ) : (
+            <>
+              <form id="copy-start-form" className="booking-card community-form" onSubmit={handleStartCopy}>
+                <div className="copy-head">
+                  <Shield size={15} style={{ verticalAlign: -2, marginRight: 6 }} />Start copying a Deriv trader
+                  <SlidersHorizontal size={14} style={{ marginLeft: 'auto', opacity: 0.6 }} />
+                </div>
+                <div className="booking-field">
+                  <span>Trader API token (read-only)</span>
+                  <input className="booking-input" value={traderToken} onChange={(e) => setTraderToken(e.target.value)} placeholder="Paste the read-only token shared by the trader" />
+                  <span className="mt-hint">A read-only token can only copy trades — it can never withdraw funds.</span>
+                </div>
+                <div className="booking-row">
+                  <div className="booking-field">
+                    <span>Assets to copy (optional)</span>
+                    <input className="booking-input" value={assetsStr} onChange={(e) => setAssetsStr(e.target.value)} placeholder="e.g. R_75, R_100, EURUSD" />
+                  </div>
+                  <div className="booking-field">
+                    <span>Stake range ({currency || 'USD'})</span>
+                    <div className="booking-row" style={{ gap: 8 }}>
+                      <input className="booking-input" type="number" min="0" step="0.01" value={minStake} onChange={(e) => setMinStake(e.target.value)} placeholder="Min" />
+                      <input className="booking-input" type="number" min="0" step="0.01" value={maxStake} onChange={(e) => setMaxStake(e.target.value)} placeholder="Max" />
+                    </div>
+                  </div>
+                </div>
+                <div className="booking-field">
+                  <span>Trade types to copy (optional)</span>
+                  <div className="chip-row">
+                    {COPY_TYPES.map((t) => (
+                      <button type="button" key={t} className={`chip ${selTypes.includes(t) ? 'chip-on' : ''}`} onClick={() => toggleType(t)}>
+                        {selTypes.includes(t) && <Check size={12} style={{ verticalAlign: -2, marginRight: 4 }} />}{t}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <button className="btn-primary booking-submit" type="submit" disabled={copyBusy}>
+                  {copyBusy ? 'Working…' : 'Start copying'}
+                </button>
+              </form>
+
+              <div className="copy-card">
+                <div className="copy-card-head">
+                  <Zap size={15} style={{ verticalAlign: -2, marginRight: 6 }} />My copy trading
+                  <button className="btn-icon copy-refresh" onClick={loadDeriv} title="Refresh"><RefreshCw size={14} /></button>
+                </div>
+                {copyBusy && activeCopies.length === 0 && <div className="mt-hint">Loading…</div>}
+                {!copyBusy && activeCopies.length === 0 && <div className="mt-hint">You are not copying any traders yet.</div>}
+                {activeCopies.map((c, i) => {
+                  const tr = c.trader || c;
+                  const filters = [...(c.assets || []), ...(c.trade_types || [])];
+                  return (
+                    <div className="copy-row" key={c.token || i}>
+                      <span className="trader-cell">
+                        <span className="trader-avatar">{(tr.short_name || tr.name || '?').slice(0, 1).toUpperCase()}</span>
+                        <span>
+                          <strong>{tr.short_name || tr.name || 'Trader'}</strong>
+                          <div className="circle-desc">
+                            {maskToken(c.token)} · since {c.creation_date ? new Date(c.creation_date).toLocaleDateString() : '—'}
+                            {c.min_trade_stake != null && ` · ${c.min_trade_stake}–${c.max_trade_stake != null ? c.max_trade_stake : '∞'}`}
+                          </div>
+                          {filters.length > 0 && <div className="chip-row">{filters.map((f) => <span key={f} className="chip">{f}</span>)}</div>}
+                        </span>
+                      </span>
+                      <span className={c.status === 'active' ? 'roi-up' : 'roi-down'}>{c.status || 'active'}</span>
+                      <button className="btn-outline btn-small" onClick={() => handleStopCopy(c.token)}>Stop</button>
+                    </div>
+                  );
+                })}
               </div>
-            </div>
-          </div>
-          <div className="booking-field">
-            <span>Restart behaviour</span>
-            <select className="select" value={tradeAgain} onChange={(e) => setTradeAgain(e.target.value)}>
-              <option value="both">After every trade</option>
-              <option value="win">Only after a win</option>
-              <option value="loss">Only after a loss</option>
-            </select>
-          </div>
-          {error && <div className="mt-error">{error}</div>}
-          <button className="btn-primary booking-submit" type="submit" disabled={uploading}>
-            {uploading ? 'Publishing…' : 'Publish strategy'}
-          </button>
-        </form>
+
+              <div className="copy-card">
+                <div className="copy-card-head"><Trophy size={15} style={{ verticalAlign: -2, marginRight: 6 }} />Top Deriv traders</div>
+                {copyBusy && topTraders.length === 0 && <div className="mt-hint">Loading…</div>}
+                {!copyBusy && topTraders.length === 0 && !copyError && <div className="mt-hint">No traders available to copy.</div>}
+                {topTraders.map((t, i) => (
+                  <div className="copy-row" key={t.loginid || t.token || i}>
+                    <span className="trader-cell">
+                      <span className="trader-rank">{i + 1}</span>
+                      <span className="trader-avatar">{(t.shortName || t.name || '?').slice(0, 1).toUpperCase()}</span>
+                      <span>
+                        <strong>{t.name}</strong>
+                        <div className="circle-desc">
+                          {[t.shortName, t.country].filter(Boolean).join(' · ') || 'Deriv trader'}
+                          {t.rating > 0 && ` · ${'★'.repeat(Math.min(5, Math.round(t.rating)))}`}
+                        </div>
+                      </span>
+                    </span>
+                    <span className="copy-stat">
+                      <div className={t.monthlyProfit >= 0 ? 'roi-up' : 'roi-down'}>{fmtMoney(t.monthlyProfit, currency)}</div>
+                      <div className="circle-desc">{t.monthlyTrades} trades this month</div>
+                    </span>
+                    <span className="copy-stat">
+                      <div>{t.followers}</div>
+                      <div className="circle-desc">followers</div>
+                    </span>
+                    <span className="copy-stat">
+                      <div>{t.activeBots}</div>
+                      <div className="circle-desc">active bots</div>
+                    </span>
+                    <span className="community-actions">
+                      <button className="btn-outline btn-small" onClick={() => openStats(t)}><Eye size={13} style={{ verticalAlign: -2, marginRight: 4 }} />Stats</button>
+                      {t.token ? (
+                        <button className="btn-primary btn-small" onClick={() => { setTraderToken(t.token); setCopyError(null); const el = document.getElementById('copy-start-form'); if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' }); }}>
+                          <PlayCircle size={13} style={{ verticalAlign: -2, marginRight: 4 }} />Copy
+                        </button>
+                      ) : t.isFollowing ? (
+                        <button className="btn-outline btn-small" onClick={() => handleStopCopy(t.token)}>Stop</button>
+                      ) : null}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+        </>
       )}
 
-      <div className="table-card">
-        <div className="table-row table-head">
-          <span>Strategy</span><span>Followers</span><span>Status</span><span></span>
-        </div>
-        {busy && strategies.length === 0 && <div className="table-row"><span className="mt-hint">Loading strategies…</span></div>}
-        {!busy && strategies.length === 0 && !error && (
-          <div className="table-row"><span className="mt-hint">No strategies yet — publish the first one!</span></div>
-        )}
-        {strategies.map((s) => {
-          const following = follows.has(s.id);
-          const desc = describeParams(s.params);
-          return (
-            <div className="table-row" key={s.id}>
-              <span className="trader-cell">
-                {s.banner ? <img src={s.banner} alt="" className="table-banner" /> : <span className="trader-avatar">{s.name.slice(0, 1).toUpperCase()}</span>}
-                <span>
-                  {s.name} {s.owned && <span className="circle-owned">yours</span>}
-                  {desc && <div className="circle-desc">{desc}</div>}
-                </span>
-              </span>
-              <span>{s.followers}</span>
-              <span className={s.status === 'active' ? 'roi-up' : 'roi-down'}>{s.status}</span>
-              <span className="community-actions">
-                <button className={`btn-primary btn-small ${following ? 'btn-active' : ''}`} onClick={() => handleFollow(s, !following)}>
-                  {following ? 'Following' : 'Follow'}
-                </button>
-                <button className="btn-outline btn-small" onClick={() => handleCopy(s)}>Copy</button>
-                {s.owned && <button className="btn-outline btn-small" onClick={() => handleDelete(s)}>Delete</button>}
-              </span>
+      {tab === 'community' && (
+        <>
+          <div className="community-actions">
+            <div className="community-search">
+              <Search size={14} style={{ verticalAlign: -2, marginRight: 6 }} />
+              <input className="booking-input" value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search strategies…" />
             </div>
-          );
-        })}
-      </div>
+            <select className="select" value={sortBy} onChange={(e) => setSortBy(e.target.value)}>
+              <option value="newest">Newest first</option>
+              <option value="followers">Most followed</option>
+              <option value="name">Name (A–Z)</option>
+            </select>
+            <button className="btn-outline btn-small" onClick={() => setShowForm((v) => !v)}>
+              {showForm ? 'Cancel' : '+ Publish a strategy'}
+            </button>
+          </div>
+
+          {showForm && (
+            <form className="booking-card community-form" onSubmit={handlePublish}>
+              <div className="booking-field">
+                <span>Strategy name</span>
+                <input className="booking-input" value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Volatility 75 Rise Runner" required />
+              </div>
+              <div className="booking-field">
+                <span>Description (optional)</span>
+                <input className="booking-input" value={description} onChange={(e) => setDescription(e.target.value)} placeholder="Rules, timeframe, risk notes…" />
+              </div>
+              <div className="booking-field">
+                <span>Banner image</span>
+                <BannerPicker banner={banner} onChange={setBanner} session={sessionId} account={selectedAccount} />
+              </div>
+              <div className="booking-row">
+                <div className="booking-field">
+                  <span>Symbol</span>
+                  <select className="select" value={symbol} onChange={(e) => setSymbol(e.target.value)}>
+                    {symbols.length === 0 && <option value="R_75">R_75</option>}
+                    {Object.entries(symbolOpts).map(([market, list]) => (
+                      <optgroup key={market} label={market}>
+                        {list.map((s) => <option key={s.symbol} value={s.symbol}>{s.symbol}</option>)}
+                      </optgroup>
+                    ))}
+                  </select>
+                </div>
+                <div className="booking-field">
+                  <span>Contract type</span>
+                  <select className="select" value={contractType} onChange={(e) => setContractType(e.target.value)}>
+                    {Object.entries(COPY_TYPE_LABELS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
+                  </select>
+                </div>
+              </div>
+              <div className="booking-row">
+                <div className="booking-field">
+                  <span>Stake ({currency || 'USD'})</span>
+                  <input className="booking-input" type="number" min="0.01" step="0.01" value={stake} onChange={(e) => setStake(Number(e.target.value))} />
+                </div>
+                <div className="booking-field">
+                  <span>Duration</span>
+                  <div className="booking-row" style={{ gap: 8 }}>
+                    <input className="booking-input" type="number" min="1" value={duration} onChange={(e) => setDuration(Number(e.target.value))} />
+                    <select className="select" value={durationUnit} onChange={(e) => setDurationUnit(e.target.value)}>
+                      {Object.entries(COPY_UNIT_LABELS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
+                    </select>
+                  </div>
+                </div>
+              </div>
+              <div className="booking-field">
+                <span>Restart behaviour</span>
+                <select className="select" value={tradeAgain} onChange={(e) => setTradeAgain(e.target.value)}>
+                  <option value="both">After every trade</option>
+                  <option value="win">Only after a win</option>
+                  <option value="loss">Only after a loss</option>
+                </select>
+              </div>
+              {error && <div className="mt-error">{error}</div>}
+              <button className="btn-primary booking-submit" type="submit" disabled={uploading}>
+                {uploading ? 'Publishing…' : 'Publish strategy'}
+              </button>
+            </form>
+          )}
+
+          <div className="table-card">
+            <div className="table-row table-head">
+              <span>Strategy</span><span>Followers</span><span>Status</span><span></span>
+            </div>
+            {busy && strategies.length === 0 && <div className="table-row"><span className="mt-hint">Loading strategies…</span></div>}
+            {!busy && strategies.length === 0 && !error && (
+              <div className="table-row"><span className="mt-hint">No strategies yet — publish the first one!</span></div>
+            )}
+            {!busy && strategies.length > 0 && filtered.length === 0 && (
+              <div className="table-row"><span className="mt-hint">No strategies match your search.</span></div>
+            )}
+            {filtered.map((s) => {
+              const following = follows.has(s.id);
+              const desc = describeParams(s.params);
+              return (
+                <div className="table-row" key={s.id}>
+                  <span className="trader-cell">
+                    {s.banner ? <img src={s.banner} alt="" className="table-banner" /> : <span className="trader-avatar">{s.name.slice(0, 1).toUpperCase()}</span>}
+                    <span>
+                      {s.name} {s.owned && <span className="circle-owned">yours</span>}
+                      {desc && <div className="circle-desc">{desc}</div>}
+                    </span>
+                  </span>
+                  <span>{s.followers}</span>
+                  <span className={s.status === 'active' ? 'roi-up' : 'roi-down'}>{s.status}</span>
+                  <span className="community-actions">
+                    <button className={`btn-primary btn-small ${following ? 'btn-active' : ''}`} onClick={() => handleFollow(s, !following)}>
+                      {following ? 'Following' : 'Follow'}
+                    </button>
+                    <button className="btn-outline btn-small" onClick={() => handleCopy(s)}>Copy</button>
+                    {s.owned && <button className="btn-outline btn-small" onClick={() => handleDelete(s)}>Delete</button>}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        </>
+      )}
+
+      {(stats || statsBusy) && (
+        <div className="modal-overlay" onClick={() => { setStats(null); setStatsBusy(false); }}>
+          <div className="auth-modal copy-stats-modal" onClick={(e) => e.stopPropagation()}>
+            <button className="btn-icon auth-close" onClick={() => { setStats(null); setStatsBusy(false); }} aria-label="Close"><X size={16} /></button>
+            <h3>{(statsFor && (statsFor.name || statsFor.shortName)) || 'Trader statistics'}</h3>
+            {statsBusy ? (
+              <div className="mt-hint">Loading statistics…</div>
+            ) : (
+              <>
+                <div className="stats-grid">
+                  <div className="stats-cell">
+                    <span>Win ratio</span>
+                    <b>{(() => {
+                      const wr = pickStat('performance.win_ratio', 'trading.win_ratio', 'win_ratio');
+                      if (wr == null) return '—';
+                      return `${(Number(wr) * (wr <= 1 ? 100 : 1)).toFixed(1)}%`;
+                    })()}</b>
+                  </div>
+                  <div className="stats-cell">
+                    <span>Total trades</span>
+                    <b>{pickStat('total_trades', 'performance.trades', 'trading.number_of_trades') ?? '—'}</b>
+                  </div>
+                  <div className="stats-cell">
+                    <span>Profit</span>
+                    <b className="roi-up">{fmtMoney(pickStat('performance.profit', 'overall_performance.profit', 'current_month_performance.profit'), currency)}</b>
+                  </div>
+                  <div className="stats-cell">
+                    <span>Loss</span>
+                    <b className="roi-down">{fmtMoney(pickStat('performance.loss', 'overall_performance.loss', 'current_month_performance.loss'), currency)}</b>
+                  </div>
+                  <div className="stats-cell">
+                    <span>Risk</span>
+                    <b>{(() => {
+                      const r = pickStat('risk.risk_status', 'risk_status');
+                      const s = pickStat('risk.risk_score', 'risk_score');
+                      return r || (s != null ? `score ${s}` : '—');
+                    })()}</b>
+                  </div>
+                  <div className="stats-cell">
+                    <span>Copiers</span>
+                    <b>{pickStat('copiers_count', 'copiers') ?? '—'}</b>
+                  </div>
+                  <div className="stats-cell">
+                    <span>Active bots</span>
+                    <b>{pickStat('current_active_bots', 'active_bots') ?? '—'}</b>
+                  </div>
+                  <div className="stats-cell">
+                    <span>Status</span>
+                    <b className={pickStat('status') === 'active' ? 'roi-up' : 'roi-down'}>{pickStat('status') ?? '—'}</b>
+                  </div>
+                </div>
+                {(pickStat('trading.total_stake', 'total_stake') != null || pickStat('trading.average_duration', 'average_duration') != null) && (
+                  <div className="stats-sub">
+                    <b>Copy trading</b>
+                    <span>Total stake: {fmtMoney(pickStat('trading.total_stake', 'total_stake'), currency)} · Avg duration: {pickStat('trading.average_duration', 'average_duration') ?? '—'}</span>
+                    <span>Contracts won: {pickStat('trading.won_contracts', 'won_contracts') ?? '—'} · lost: {pickStat('trading.lost_contracts', 'lost_contracts') ?? '—'}</span>
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -2042,7 +2442,7 @@ const MT_TYPE_NAMES = {
   VANILLALONGCALL: 'Vanilla Call', VANILLALONGPUT: 'Vanilla Put',
   TURBOSLONG: 'Turbo Long', TURBOSSHORT: 'Turbo Short',
 };
-const MT_UNIT_LABELS = { t: 'ticks', s: 'sec', m: 'min', h: 'hrs', d: 'days' };
+const MT_UNIT_LABELS = { t: 'ticks', s: 'sec', m: 'min' };
 const MT_UNIT_SECONDS = { s: 1, m: 60, h: 3600, d: 86400 };
 
 function formatRemaining(ms) {
@@ -2068,7 +2468,7 @@ const MT_MENU = [
   { id: 'accumulators', label: 'Accumulators', up: 'ACCU', down: 'ACCU' },
 ];
 
-function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAccount, balance, onBalanceUpdate, currency, onTradeSettled, theme }) {
+function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAccount, balance, onBalanceUpdate, currency, onTradeSettled, theme, onLogin, embedded }) {
   const [symbols, setSymbols] = useState([]);
   const [symbolsError, setSymbolsError] = useState(null);
   const [symbol, setSymbol] = useState(null);
@@ -2076,6 +2476,7 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
   const [contractCategories, setContractCategories] = useState([]);
   const [menu, setMenu] = useState('risefall');
 
+  const [chartType, setChartType] = useState('candlestick');
   const [duration, setDuration] = useState(5);
   const [durationUnit, setDurationUnit] = useState('t');
   const [stake, setStake] = useState(10);
@@ -2100,10 +2501,34 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
   const [marketStatus, setMarketStatus] = useState(null);
   const [now, setNow] = useState(Date.now());
 
+  const [openTrades, setOpenTrades] = useState([]); // live multi-contract list
+  const [closeAllBusy, setCloseAllBusy] = useState(false);
+
   const wsRef = useRef(null);
   const settleRef = useRef(null);
   const contractMetaRef = useRef(null);
   const contractIdRef = useRef(null);
+  const openTradesRef = useRef([]);
+
+  useEffect(() => { contractMetaRef.current = contractMeta; }, [contractMeta]);
+  useEffect(() => { contractIdRef.current = contractMeta?.contract_id ?? null; }, [contractMeta]);
+  useEffect(() => { openTradesRef.current = openTrades; }, [openTrades]);
+
+  const toNum = (v) => { const n = Number(v); return Number.isFinite(n) ? n : 0; };
+  const normOpen = (c) => ({
+    contract_id: c.contract_id,
+    symbol: c.symbol,
+    contract_type: c.contract_type,
+    buy_price: toNum(c.buy_price),
+    payout: toNum(c.payout),
+    status: c.status || 'open',
+    entry_spot: c.entry_spot ?? null,
+    current_spot: c.current_spot ?? null,
+    sell_price: c.sell_price ?? null,
+    is_valid_to_sell: !!c.is_valid_to_sell,
+    date_expiry: c.date_expiry ?? null,
+    purchase_time: c.purchase_time ?? null,
+  });
 
   useEffect(() => { contractMetaRef.current = contractMeta; }, [contractMeta]);
   useEffect(() => { contractIdRef.current = contractMeta?.contract_id ?? null; }, [contractMeta]);
@@ -2128,7 +2553,7 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
     if (!t) for (const c of contractCategories) for (const x of c.types) if (x.contract_type === currentMenu.down) { t = x; break; }
     return t;
   })();
-  const unitOptions = activeTypeInfo?.units?.length ? activeTypeInfo.units : ['t', 'm', 'h'];
+  const unitOptions = activeTypeInfo?.units?.length ? activeTypeInfo.units : ['t', 's', 'm'];
 
   const upLabel = menu === 'matchdiff' ? `Matches ${digit}` : menu === 'evenodd' ? 'Even' : menu === 'accumulators' ? 'Up' : typeLabel(currentMenu.up);
   const downLabel = menu === 'matchdiff' ? `Differs ${digit}` : menu === 'evenodd' ? 'Odd' : menu === 'accumulators' ? 'Down' : typeLabel(currentMenu.down);
@@ -2250,14 +2675,44 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
       settleRef.current = poc.contract_id;
       const meta = contractMetaRef.current || {};
       const profit = poc.profit ?? 0;
-      setResult({ won: profit >= 0, profit, soldEarly: false });
-      setContract(null);
-      setContractMeta(null);
-      onTradeSettled({ id: poc.contract_id, symbol, direction: meta.contract_type, stake: meta.price ?? 0, profit, won: profit >= 0, ts: Date.now() });
+      const wasChart = contractIdRef.current === poc.contract_id;
+      if (wasChart) {
+        setResult({ won: profit >= 0, profit, soldEarly: false });
+        setContract(null);
+        setContractMeta(null);
+      }
+      setOpenTrades((prev) => prev.filter((t) => t.contract_id !== poc.contract_id));
+      onTradeSettled && onTradeSettled({
+        id: poc.contract_id,
+        symbol: poc.symbol || symbol,
+        direction: (wasChart && meta.contract_type) || poc.contract_type || 'UNKNOWN',
+        stake: (wasChart && meta.price) || poc.buy_price || 0,
+        profit,
+        payout: poc.payout ?? meta.payout ?? 0,
+        won: profit >= 0,
+        ts: Date.now(),
+      });
       refreshBalance();
       return;
     }
-    setContract(poc);
+    // Live update for the multi-contract active list (upsert by contract_id).
+    setOpenTrades((prev) => {
+      const idx = prev.findIndex((t) => t.contract_id === poc.contract_id);
+      const upd = {
+        ...(idx >= 0 ? prev[idx] : {}),
+        contract_id: poc.contract_id,
+        symbol: poc.symbol || symbol,
+        contract_type: poc.contract_type || prev[idx]?.contract_type || null,
+        current_spot: poc.current_spot ?? null,
+        sell_price: poc.sell_price ?? null,
+        is_valid_to_sell: !!poc.is_valid_to_sell,
+        date_expiry: poc.date_expiry ?? null,
+        entry_spot: poc.entry_spot ?? null,
+      };
+      if (idx >= 0) { const next = [...prev]; next[idx] = upd; return next; }
+      return [...prev, upd];
+    });
+    if (contractIdRef.current === poc.contract_id) setContract(poc);
   };
 
   async function refreshBalance() {
@@ -2266,6 +2721,111 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
       const res = await fetch(`${API_BASE}/api/balance?session=${sessionId}&account=${selectedAccount}`);
       if (res.ok) onBalanceUpdate(await res.json());
     } catch { /* keep last known balance */ }
+  }
+
+  // Load all open contracts from Deriv portfolio (source of truth for the
+  // active-trades container) and merge with anything we already track.
+  const loadPortfolio = () => {
+    if (!sessionId || !selectedAccount) { setOpenTrades([]); return; }
+    fetch(`${API_BASE}/api/portfolio?session=${encodeURIComponent(sessionId)}&account=${encodeURIComponent(selectedAccount)}`)
+      .then((r) => (r.ok ? r.json() : Promise.reject()))
+      .then((data) => {
+        const open = (data.contracts || [])
+          .filter((c) => c && !c.is_sold && c.status !== 'sold')
+          .map(normOpen);
+        setOpenTrades((prev) => {
+          const ids = new Set(open.map((t) => t.contract_id));
+          const merged = [...open];
+          for (const t of prev) if (!ids.has(t.contract_id)) merged.push(t);
+          return merged;
+        });
+      })
+      .catch(() => { /* keep current list */ });
+  };
+
+  useEffect(() => {
+    if (!sessionId || !selectedAccount) return;
+    loadPortfolio();
+    const id = setInterval(loadPortfolio, 30000);
+    return () => clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionId, selectedAccount]);
+
+  async function sellContractById(contractId, price) {
+    const res = await fetch(`${API_BASE}/api/contract/sell`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session: sessionId, account: selectedAccount, contract_id: contractId, price }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Sell failed');
+    return data.sell;
+  }
+
+  async function handleSellOpen(t) {
+    if (!sessionId || !selectedAccount) return;
+    if (t.sell_price == null) { setActionError('This contract is not sellable yet.'); return; }
+    setBusy(true);
+    setActionError(null);
+    try {
+      const sold = await sellContractById(t.contract_id, t.sell_price);
+      const profit = (sold.sold_for ?? t.sell_price) - (t.buy_price || 0);
+      const wasChart = contractIdRef.current === t.contract_id;
+      settleRef.current = t.contract_id;
+      setOpenTrades((prev) => prev.filter((x) => x.contract_id !== t.contract_id));
+      if (wasChart) {
+        setResult({ won: profit >= 0, profit, soldEarly: true, soldFor: sold.sold_for });
+        setContract(null);
+        setContractMeta(null);
+      }
+      onTradeSettled && onTradeSettled({
+        id: t.contract_id,
+        symbol: t.symbol,
+        direction: t.contract_type,
+        stake: t.buy_price || 0,
+        profit,
+        payout: sold.sold_for ?? t.sell_price ?? 0,
+        won: profit >= 0,
+        ts: Date.now(),
+      });
+      refreshBalance();
+      loadPortfolio();
+    } catch (e) {
+      setActionError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleCloseAll() {
+    const sellable = openTrades.filter((t) => t.sell_price != null);
+    if (sellable.length === 0) { setActionError('No sellable open trades.'); return; }
+    if (!window.confirm(`Close ${sellable.length} open trade${sellable.length > 1 ? 's' : ''}?`)) return;
+    setCloseAllBusy(true);
+    setActionError(null);
+    for (const t of sellable) {
+      try {
+        const sold = await sellContractById(t.contract_id, t.sell_price);
+        const profit = (sold.sold_for ?? t.sell_price) - (t.buy_price || 0);
+        settleRef.current = t.contract_id;
+        setOpenTrades((prev) => prev.filter((x) => x.contract_id !== t.contract_id));
+        onTradeSettled && onTradeSettled({
+          id: t.contract_id,
+          symbol: t.symbol,
+          direction: t.contract_type,
+          stake: t.buy_price || 0,
+          profit,
+          payout: sold.sold_for ?? t.sell_price ?? 0,
+          won: profit >= 0,
+          ts: Date.now(),
+        });
+      } catch (e) {
+        setActionError(e.message);
+      }
+    }
+    refreshBalance();
+    loadPortfolio();
+    setCloseAllBusy(false);
   }
 
   // Extra parameters each market type needs for its proposal.
@@ -2298,9 +2858,9 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
           retry = 0;
           setWsStatus('live');
           ws.send(JSON.stringify({ action: 'subscribe', balance: true }));
-          if (contractIdRef.current) {
-            ws.send(JSON.stringify({ action: 'subscribe', contract: contractIdRef.current }));
-          }
+          const ids = new Set(openTradesRef.current.map((t) => t.contract_id).filter(Boolean));
+          if (contractIdRef.current) ids.add(contractIdRef.current);
+          for (const id of ids) ws.send(JSON.stringify({ action: 'subscribe', contract: id }));
         };
         ws.onmessage = (e) => {
           try {
@@ -2353,6 +2913,15 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
     };
   }, [contractMeta?.contract_id]);
 
+  // keep every open contract in the active list subscribed (server dedupes)
+  useEffect(() => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== 1) return;
+    for (const t of openTrades) {
+      if (t.contract_id) ws.send(JSON.stringify({ action: 'subscribe', contract: t.contract_id }));
+    }
+  }, [openTrades.length, openTrades]);
+
   // --- countdown clock for the timer lapse ---
   useEffect(() => {
     const id = setInterval(() => setNow(Date.now()), 250);
@@ -2361,7 +2930,7 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
 
   // --- proposals (price quotes) for both buy and sell sides ---
   useEffect(() => {
-    if (!sessionId || !selectedAccount || !symbol || !menu || contractMeta) { setProposals({ up: null, down: null }); return; }
+    if (!sessionId || !selectedAccount || !symbol || !menu) { setProposals({ up: null, down: null }); return; }
     let cancelled = false;
     setProposalLoading(true);
     setProposalError(null);
@@ -2391,7 +2960,7 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
   // --- buy a real contract for the chosen side (green up / red down) ---
   async function handleBuy(side) {
     const p = proposals[side];
-    if (!p || busy || contractMeta) return;
+    if (!p || busy) return;
     setBusy(true);
     setActionError(null);
     setResult(null);
@@ -2445,7 +3014,7 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
       setResult({ won: profit >= 0, profit, soldEarly: true, soldFor: sold.sold_for });
       setContract(null);
       setContractMeta(null);
-      onTradeSettled({ id: contract.contract_id, symbol, direction: contractMeta?.contract_type, stake: buyPrice, profit, won: profit >= 0, ts: Date.now() });
+      onTradeSettled && onTradeSettled({ id: contract.contract_id, symbol, direction: contractMeta?.contract_type, stake: buyPrice, profit, won: profit >= 0, ts: Date.now() });
       refreshBalance();
     } catch (e) {
       setActionError(e.message);
@@ -2520,23 +3089,15 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
     setLastTick(null);
   };
 
-  if (!sessionId) {
-    return (
-      <div className="section">
-        <h2 className="section-title">Manual Trader</h2>
-        <div className="card empty-card">
-          <p>Log in with your Deriv account to place real contracts.</p>
-        </div>
-      </div>
-    );
-  }
+  const authenticated = !!sessionId && !!selectedAccount;
 
   return (
     <div className="section mt-app">
       <div className="mt-topbar">
-        <h2 className="section-title">Manual Trader</h2>
+        {!embedded && <h2 className="section-title">Manual Trader</h2>}
         <div className="mt-top-controls">
-          <select className="select mt-account-select" value={selectedAccount || ''} onChange={(e) => setSelectedAccount(e.target.value)}>
+          <select className="select mt-account-select" value={selectedAccount || ''} onChange={(e) => setSelectedAccount(e.target.value)} disabled={accounts.length === 0}>
+            {accounts.length === 0 && <option value="">Not logged in</option>}
             {accounts.map((a) => (
               <option key={a.account} value={a.account}>{a.account} ({a.currency})</option>
             ))}
@@ -2613,51 +3174,69 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
         )}
       </div>
 
-      <div className="card mt-chart-card">
-        <div className="mt-chart-top">
-          <span className="mt-type-badge">
-            {symbol || '—'} · {currentMenu.label} · {duration} {MT_UNIT_LABELS[durationUnit]}{contractMeta ? ` · ${typeLabel(contractMeta.contract_type)}` : ''}
-          </span>
-          {contractMeta && isTickContract && (
-            <span className="mt-timer">⏱ {remainingTicks == null ? '—' : `${remainingTicks} ticks left`}</span>
-          )}
-          {contractMeta && !isTickContract && (
-            <span className="mt-timer">⏱ {formatRemaining(remainingMs)} left</span>
-          )}
-        </div>
+      {!embedded && (
+        <div className="card mt-chart-card">
+          <div className="mt-chart-top">
+            <span className="mt-type-badge">
+              {symbol || '—'} · {currentMenu.label} · {duration} {MT_UNIT_LABELS[durationUnit]}{contractMeta ? ` · ${typeLabel(contractMeta.contract_type)}` : ''}
+            </span>
+            {contractMeta && isTickContract && (
+              <span className="mt-timer">⏱ {remainingTicks == null ? '—' : `${remainingTicks} ticks left`}</span>
+            )}
+            {contractMeta && !isTickContract && (
+              <span className="mt-timer">⏱ {formatRemaining(remainingMs)} left</span>
+            )}
+            <div className="tv-gran chart-type-toggle" role="group" aria-label="Chart type">
+              <button
+                className={`tv-gran-btn ${chartType === 'area' ? 'tv-gran-active' : ''}`}
+                onClick={() => setChartType('area')}
+              >
+                Area
+              </button>
+              <button
+                className={`tv-gran-btn ${chartType === 'candlestick' ? 'tv-gran-active' : ''}`}
+                onClick={() => setChartType('candlestick')}
+              >
+                Candlestick
+              </button>
+            </div>
+          </div>
 
-        {candles.length === 0 ? (
-          <div className="tv-empty mt-empty-chart">
-            <Activity size={18} />
-            <span>Live 1s candles — waiting for ticks…</span>
-          </div>
-        ) : (
-          <CandleFeedChart
-            candles={candles}
-            decimals={decimals}
-            entryPoint={entryPoint}
-            lastPrice={lastPrice}
-            direction={contractMeta?.contract_type ?? currentMenu.up}
-            barrierLine={menu === 'highlow' ? proposalBarrier : null}
-            theme={theme}
-          />
-        )}
+          {candles.length === 0 ? (
+            <div className="tv-empty mt-empty-chart">
+              <Activity size={18} />
+              <span>Live 1s candles — waiting for ticks…</span>
+            </div>
+          ) : (
+            <CandleFeedChart
+              points={ticks}
+              candles={candles}
+              chartType={chartType}
+              decimals={decimals}
+              entryPoint={entryPoint}
+              lastPrice={lastPrice}
+              direction={contractMeta?.contract_type ?? currentMenu.up}
+              barrierLine={menu === 'highlow' ? proposalBarrier : null}
+              theme={theme}
+            />
+          )}
 
-        <div className="mt-strip">
-          <div className="mt-strip-cell">
-            <span>Current price</span>
-            <b>{lastPrice == null ? '—' : lastPrice.toLocaleString(undefined, { maximumFractionDigits: decimals })}</b>
-          </div>
-          <div className="mt-strip-cell">
-            <span>Entry point</span>
-            <b>{entryPoint?.price == null ? '—' : entryPoint.price.toLocaleString(undefined, { maximumFractionDigits: decimals })}</b>
-          </div>
-          <div className="mt-strip-cell">
-            <span>Market type</span>
-            <b>{activeSymbol ? (MT_MARKET_LABELS[activeSymbol.market] || activeSymbol.market) : '—'}</b>
+          <div className="mt-strip">
+            <div className="mt-strip-cell">
+              <span>Current price</span>
+              <b>{lastPrice == null ? '—' : lastPrice.toLocaleString(undefined, { maximumFractionDigits: decimals })}</b>
+            </div>
+            <div className="mt-strip-cell">
+              <span>Entry point</span>
+              <b>{entryPoint?.price == null ? '—' : entryPoint.price.toLocaleString(undefined, { maximumFractionDigits: decimals })}</b>
+            </div>
+            <div className="mt-strip-cell">
+              <span>Market type</span>
+              <b>{activeSymbol ? (MT_MARKET_LABELS[activeSymbol.market] || activeSymbol.market) : '—'}</b>
+            </div>
           </div>
         </div>
-      </div>
+      )}
 
       {(menu === 'matchdiff' || menu === 'evenodd') && (
         <div className="card mt-digitpad">
@@ -2710,30 +3289,77 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
         </div>
       )}
 
+      {!authenticated && (
+        <div className="mt-login-bar">
+          <span><AlertTriangle size={13} /> Log in with your Deriv account to place trades — the settings below are live for browsing.</span>
+          {onLogin && <button className="btn-primary btn-small" onClick={() => onLogin('login')}>Login with Deriv</button>}
+        </div>
+      )}
+
       <div className="mt-bottom-actions">
-        {contractMeta ? (
+        <button className="mt-side-btn mt-side-down" onClick={() => handleBuy('down')} disabled={!authenticated || !proposals.down || busy || proposalLoading}>
+          <span className="mt-side-label">{downLabel}</span>
+          <span className="mt-side-payout">{proposalLoading ? 'Pricing…' : (proposals.down ? `Payout ${proposals.down.payout.toLocaleString(undefined, { maximumFractionDigits: 2 })} ${currency}` : 'No price')}</span>
+        </button>
+        <button className="mt-side-btn mt-side-up" onClick={() => handleBuy('up')} disabled={!authenticated || !proposals.up || busy || proposalLoading}>
+          <span className="mt-side-label">{upLabel}</span>
+          <span className="mt-side-payout">{proposalLoading ? 'Pricing…' : (proposals.up ? `Payout ${proposals.up.payout.toLocaleString(undefined, { maximumFractionDigits: 2 })} ${currency}` : 'No price')}</span>
+        </button>
+        {contractMeta && (
           <div className="mt-open-inline">
             <div className="mt-open-cell"><span>Entry</span><b>{contract?.entry_spot == null ? '—' : contract.entry_spot.toLocaleString(undefined, { maximumFractionDigits: decimals })}</b></div>
             <div className="mt-open-cell"><span>Current</span><b>{contract?.current_spot == null ? '—' : contract.current_spot.toLocaleString(undefined, { maximumFractionDigits: decimals })}</b></div>
             <div className="mt-open-cell"><span>Sell at</span><b>{contract?.sell_price == null ? '—' : contract.sell_price.toLocaleString(undefined, { maximumFractionDigits: decimals })}</b></div>
-            <button className="mt-sell-btn" onClick={handleSell} disabled={!contract?.is_valid_to_sell || selling}>
+            <button className="mt-sell-btn" onClick={handleSell} disabled={!authenticated || !contract?.is_valid_to_sell || selling}>
               {selling ? 'Selling…' : 'Sell now'}
             </button>
             {!contract?.is_valid_to_sell && <span className="mt-hint">Not sellable yet</span>}
           </div>
-        ) : (
-          <>
-            <button className="mt-side-btn mt-side-down" onClick={() => handleBuy('down')} disabled={!proposals.down || busy || proposalLoading}>
-              <span className="mt-side-label">{downLabel}</span>
-              <span className="mt-side-payout">{proposalLoading ? 'Pricing…' : (proposals.down ? `Payout ${proposals.down.payout.toLocaleString(undefined, { maximumFractionDigits: 2 })} ${currency}` : 'No price')}</span>
-            </button>
-            <button className="mt-side-btn mt-side-up" onClick={() => handleBuy('up')} disabled={!proposals.up || busy || proposalLoading}>
-              <span className="mt-side-label">{upLabel}</span>
-              <span className="mt-side-payout">{proposalLoading ? 'Pricing…' : (proposals.up ? `Payout ${proposals.up.payout.toLocaleString(undefined, { maximumFractionDigits: 2 })} ${currency}` : 'No price')}</span>
-            </button>
-          </>
         )}
       </div>
+
+      {authenticated && (
+        <div className="card mt-open-card">
+          <div className="mt-active-head">
+            <span className="card-label">Active trades ({openTrades.length})</span>
+            <button className="btn-outline btn-small" onClick={handleCloseAll} disabled={closeAllBusy || openTrades.length === 0}>
+              {closeAllBusy ? 'Closing…' : 'Close all'}
+            </button>
+          </div>
+          {openTrades.length === 0 && <div className="mt-hint">No open trades — the ones you buy appear here with a live close price.</div>}
+          <div className="mt-active-list">
+            {openTrades.map((t) => {
+              const profit = t.sell_price != null ? t.sell_price - (t.buy_price || 0) : null;
+              const isChart = contractIdRef.current === t.contract_id;
+              return (
+                <div className="mt-active-row" key={t.contract_id}>
+                  <span className="mt-active-cell">
+                    <b>{t.symbol || '—'}</b>
+                    <span>{typeLabel(t.contract_type) || t.contract_type || '—'}{isChart && ' · current'}</span>
+                  </span>
+                  <span className="mt-active-cell">
+                    <b>{toNum(t.buy_price).toLocaleString(undefined, { maximumFractionDigits: 2 })} {currency}</b>
+                    <span>stake</span>
+                  </span>
+                  <span className="mt-active-cell">
+                    <b>{t.current_spot == null ? '—' : t.current_spot.toLocaleString(undefined, { maximumFractionDigits: decimals })}</b>
+                    <span>current</span>
+                  </span>
+                  <span className="mt-active-cell">
+                    <b className={profit != null && profit >= 0 ? 'roi-up' : 'roi-down'}>
+                      {profit != null ? `${profit >= 0 ? '+' : ''}${profit.toLocaleString(undefined, { maximumFractionDigits: 2 })}` : '—'}
+                    </b>
+                    <span>P/L</span>
+                  </span>
+                  <button className="btn-outline btn-small" onClick={() => handleSellOpen(t)} disabled={busy || t.sell_price == null}>
+                    {t.sell_price == null ? 'Not sellable' : 'Close'}
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       {result && (
         <div className={`mt-result ${result.won ? 'mt-result-won' : 'mt-result-lost'}`}>
@@ -2899,26 +3525,6 @@ function LineFeedChart({ points, candles, chartType, decimals, entryPoint, lastP
     }
   }, [lastPrice]);
 
-  // barrier price line (Highs/Lows trades) — dashed indigo marker
-  useEffect(() => {
-    const series = seriesRef.current;
-    if (!series) return;
-    if (barrierLineRef.current) {
-      try { series.removePriceLine(barrierLineRef.current); } catch { /* noop */ }
-      barrierLineRef.current = null;
-    }
-    if (barrierLine != null && Number.isFinite(barrierLine)) {
-      barrierLineRef.current = series.createPriceLine({
-        price: barrierLine,
-        color: '#4c6ef5',
-        lineWidth: 1,
-        lineStyle: LineStyle.Dashed,
-        title: 'Barrier',
-        axisLabelVisible: true,
-      });
-    }
-  }, [barrierLine]);
-
   return <div className="mt-chart-canvas" ref={containerRef} />;
 }
 
@@ -2946,13 +3552,13 @@ function aggregateCandles(ticks, granSec) {
 }
 
 // ---------------------------------------------------------------------
-// Live candlestick chart for the Manual Trader (lightweight-charts v5).
-// Mirrors Deriv's DTrader chart: live candles for the symbol, a dashed
-// entry line + arrow where the contract opened, and a dotted current
-// price line. Updates incrementally without rebuilding the chart.
+// Live chart for the Manual Trader (lightweight-charts v5). Mirrors
+// Deriv's DTrader chart: area or 1s candlesticks for the symbol, a
+// dashed entry line + arrow where the contract opened, and a dotted
+// current price line. Updates incrementally without rebuilding the chart.
 // ---------------------------------------------------------------------
 
-function CandleFeedChart({ candles, decimals, entryPoint, lastPrice, direction, barrierLine, theme }) {
+function CandleFeedChart({ points, candles, chartType, decimals, entryPoint, lastPrice, direction, barrierLine, theme }) {
   const containerRef = useRef(null);
   const chartRef = useRef(null);
   const seriesRef = useRef(null);
@@ -2963,6 +3569,7 @@ function CandleFeedChart({ candles, decimals, entryPoint, lastPrice, direction, 
   const appliedLen = useRef(0);
 
   const toBar = (c) => ({ time: Math.floor(c.t / 1000), open: c.o, high: c.h, low: c.l, close: c.c });
+  const toPoint = (p) => ({ time: p.t, value: p.price });
 
   const systemLight = typeof window !== 'undefined' && window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches;
   const isLight = theme === 'light' || (theme === 'system' && systemLight);
@@ -2993,14 +3600,22 @@ function CandleFeedChart({ candles, decimals, entryPoint, lastPrice, direction, 
       },
     });
 
-    const series = chart.addSeries(CandlestickSeries, {
-      upColor: '#00d0a0',
-      downColor: '#ff444f',
-      borderVisible: false,
-      wickUpColor: '#00d0a0',
-      wickDownColor: '#ff444f',
-      priceFormat: { type: 'price', precision: decimals, minMove: 1 / Math.pow(10, decimals) },
-    });
+    const series = chart.addSeries(chartType === 'candlestick' ? CandlestickSeries : AreaSeries, chartType === 'candlestick'
+      ? {
+        upColor: '#00d0a0',
+        downColor: '#ff444f',
+        borderVisible: false,
+        wickUpColor: '#00d0a0',
+        wickDownColor: '#ff444f',
+        priceFormat: { type: 'price', precision: decimals, minMove: 1 / Math.pow(10, decimals) },
+      }
+      : {
+        lineColor: '#4c6ef5',
+        topColor: 'rgba(76,110,245,0.35)',
+        bottomColor: 'rgba(76,110,245,0.02)',
+        lineWidth: 2,
+        priceFormat: { type: 'price', precision: decimals, minMove: 1 / Math.pow(10, decimals) },
+      });
     markersRef.current = createSeriesMarkers(series, []);
 
     chartRef.current = chart;
@@ -3017,28 +3632,30 @@ function CandleFeedChart({ candles, decimals, entryPoint, lastPrice, direction, 
       markersRef.current = null;
       appliedLen.current = 0;
     };
-  }, [decimals, colors.bg, colors.text, colors.grid, colors.border, colors.crosshair, colors.labelBg]);
+  }, [chartType, decimals, colors.bg, colors.text, colors.grid, colors.border, colors.crosshair, colors.labelBg]);
 
-  // push live candles incrementally (full reset when a new set arrives)
+  // push live data incrementally (full reset when history/mode changes)
   useEffect(() => {
     const series = seriesRef.current;
     if (!series) return;
-    if (candles.length === 0) {
+    const data = chartType === 'candlestick' ? candles : points;
+    if (data.length === 0) {
       series.setData([]);
       appliedLen.current = 0;
       return;
     }
     const prev = appliedLen.current;
-    if (prev === 0 || prev > candles.length || candles.length > prev + 1) {
-      series.setData(candles.map(toBar));
+    const toItem = chartType === 'candlestick' ? toBar : toPoint;
+    if (prev === 0 || prev > data.length || data.length > prev + 1) {
+      series.setData(data.map(toItem));
     } else {
-      // Either a new candle was appended, or the forming candle moved in
+      // Either a new bar/point was appended, or the forming candle moved in
       // place (more ticks landed in the current second) — update the last bar.
-      series.update(toBar(candles[candles.length - 1]));
+      series.update(toItem(data[data.length - 1]));
     }
-    appliedLen.current = candles.length;
+    appliedLen.current = data.length;
     chartRef.current?.timeScale().scrollToRealTime();
-  }, [candles]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [points, candles, chartType]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // entry price line + arrow marker
   useEffect(() => {
@@ -3089,107 +3706,31 @@ function CandleFeedChart({ candles, decimals, entryPoint, lastPrice, direction, 
     }
   }, [lastPrice]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // barrier price line (Highs/Lows trades) — dashed indigo marker
+  useEffect(() => {
+    const series = seriesRef.current;
+    if (!series) return;
+    if (barrierLineRef.current) {
+      try { series.removePriceLine(barrierLineRef.current); } catch { /* noop */ }
+      barrierLineRef.current = null;
+    }
+    if (barrierLine != null && Number.isFinite(barrierLine)) {
+      barrierLineRef.current = series.createPriceLine({
+        price: barrierLine,
+        color: '#4c6ef5',
+        lineWidth: 1,
+        lineStyle: LineStyle.Dashed,
+        title: 'Barrier',
+        axisLabelVisible: true,
+      });
+    }
+  }, [barrierLine]); // eslint-disable-line react-hooks/exhaustive-deps
+
   return <div className="mt-chart-canvas" ref={containerRef} />;
 }
 
 // ---------------- Bot runner (big modal) ----------------
 
-function BotSidebar({ sidebarTab, setSidebarTab, botRunning, toggleBot, resetStats, stats, profitLoss, currency, openContracts, trades, onClose }) {
-  const recentTrades = [...trades].reverse().slice(0, 12);
-  return (
-    <div className="modal-overlay" onClick={onClose}>
-      <div className="bot-modal" role="dialog" aria-modal="true" onClick={(e) => e.stopPropagation()}>
-        <div className="sidebar-topbar">
-          <div className="modal-title">Bot Runner</div>
-          <div className="modal-tools">
-            <span className="run-status">{botRunning ? 'Monitoring open contracts' : 'Bot is idle'}</span>
-            <button className={`run-btn ${botRunning ? 'run-btn-active' : ''}`} onClick={toggleBot}>
-              <Play size={14} fill={botRunning ? 'currentColor' : 'none'} />
-              {botRunning ? 'Stop' : 'Run'}
-            </button>
-            <button className="btn-icon" onClick={onClose}><X size={16} /></button>
-          </div>
-        </div>
-
-        <div className="sidebar-tabs">
-          {['summary', 'transactions', 'journal'].map((t) => (
-            <button
-              key={t}
-              className={`sidebar-tab ${sidebarTab === t ? 'sidebar-tab-active' : ''}`}
-              onClick={() => setSidebarTab(t)}
-            >
-              {t[0].toUpperCase() + t.slice(1)}
-            </button>
-          ))}
-        </div>
-
-        <div className="sidebar-body">
-          {sidebarTab === 'summary' && (
-            <>
-              {stats.runs === 0 ? (
-                <div className="sidebar-empty">
-                  <p>Real contract results from the <strong>Manual Trader</strong> tab are tracked here.<br />Hit <strong>Run</strong> to watch your open contracts live.</p>
-                </div>
-              ) : (
-                <div className="sidebar-empty">
-                  <p>{stats.runs} real contract{stats.runs === 1 ? '' : 's'} settled this session.</p>
-                  <p style={{ marginTop: 8 }}>{openContracts.length} open right now.</p>
-                </div>
-              )}
-            </>
-          )}
-          {sidebarTab === 'transactions' && (
-            <div className="sidebar-ledger">
-              {recentTrades.length === 0 ? (
-                <div className="sidebar-empty"><p>No settled contracts yet. Buy one in Manual Trader.</p></div>
-              ) : (
-                recentTrades.map((t) => (
-                  <div className="ledger-row" key={`${t.id}-${t.ts}`}>
-                    <span className="ledger-dir">{t.direction || '—'}</span>
-                    <span className="ledger-sym">{t.symbol}</span>
-                    <span className={t.won ? 'roi-up' : 'roi-down'}>
-                      {t.profit >= 0 ? '+' : ''}{t.profit.toFixed(2)} {currency}
-                    </span>
-                  </div>
-                ))
-              )}
-            </div>
-          )}
-          {sidebarTab === 'journal' && (
-            <div className="sidebar-ledger">
-              {openContracts.length === 0 ? (
-                <div className="sidebar-empty">
-                  <p>{botRunning ? 'No open contracts on this account right now.' : 'Open contracts will appear here while running.'}</p>
-                </div>
-              ) : (
-                openContracts.map((c) => (
-                  <div className="ledger-row" key={c.contract_id}>
-                    <span className="ledger-dir">Open</span>
-                    <span className="ledger-sym" title={c.longcode}>{c.contract_id}</span>
-                    <span>{c.currency}</span>
-                  </div>
-                ))
-              )}
-            </div>
-          )}
-        </div>
-
-        <div className="stats-grid">
-          <Stat label="Total stake" value={`${stats.totalStake.toFixed(2)} ${currency}`} />
-          <Stat label="Total payout" value={`${stats.totalPayout.toFixed(2)} ${currency}`} />
-          <Stat label="No. of runs" value={stats.runs} />
-          <Stat label="Contracts lost" value={stats.lost} />
-          <Stat label="Contracts won" value={stats.won} />
-          <Stat label="Total profit/loss" value={`${profitLoss.toFixed(2)} ${currency}`} highlight={profitLoss >= 0 ? 'up' : 'down'} />
-        </div>
-
-        <button className="reset-btn" onClick={resetStats}>
-          <RotateCcw size={14} /> Reset
-        </button>
-      </div>
-    </div>
-  );
-}
 
 // ---------------- Log in / Sign up modal (gated bot run) ----------------
 
@@ -3416,14 +3957,6 @@ function CashierModal({ mode, sessionId, accounts, selectedAccount, setSelectedA
   );
 }
 
-function Stat({ label, value, highlight }) {
-  return (
-    <div className="stat">
-      <div className="stat-label">{label}</div>
-      <div className={`stat-value ${highlight === 'up' ? 'roi-up' : highlight === 'down' ? 'roi-down' : ''}`}>{value}</div>
-    </div>
-  );
-}
 
 // ---------------- Global styles ----------------
 
@@ -3603,6 +4136,23 @@ function GlobalStyle() {
       .table-row { display: grid; grid-template-columns: 2fr 1fr 1fr 0.8fr; align-items: center; gap: 8px; padding: 12px 16px; font-size: 13px; border-bottom: 1px solid var(--border); }
       .table-row:last-child { border-bottom: none; }
       .table-head { color: var(--text-muted); font-size: 11px; text-transform: uppercase; font-weight: 700; }
+      .table-row-5 { grid-template-columns: 1.6fr 1fr 1fr 1fr 1.2fr; }
+      .dash-trades { display: flex; flex-direction: column; gap: 12px; margin-top: 18px; }
+      .dash-trades-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+      .dash-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; }
+      .stat-card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px; display: flex; flex-direction: column; gap: 2px; }
+      .stat-card-net { border-color: var(--accent-indigo); }
+      .stat-label { font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.04em; font-weight: 700; }
+      .stat-card b { font-size: 22px; font-weight: 800; }
+      .stat-sub { font-size: 11px; color: var(--text-muted); }
+      .mt-open-card { margin-top: 16px; }
+      .mt-active-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
+      .mt-active-list { display: flex; flex-direction: column; }
+      .mt-active-row { display: grid; grid-template-columns: minmax(120px, 1.6fr) 0.9fr 1fr 1fr auto; align-items: center; gap: 10px; padding: 10px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
+      .mt-active-row:last-child { border-bottom: none; }
+      .mt-active-cell { display: flex; flex-direction: column; gap: 1px; line-height: 1.3; }
+      .mt-active-cell b { font-weight: 700; }
+      .mt-active-cell > span { font-size: 11px; color: var(--text-muted); }
       .trader-cell { display: flex; align-items: center; gap: 8px; }
       .trader-avatar { width: 26px; height: 26px; border-radius: 50%; object-fit: cover; }
       .community-actions { margin-bottom: 14px; }
@@ -3611,6 +4161,27 @@ function GlobalStyle() {
       .circle-avatar { width: 40px; height: 40px; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-weight: 800; font-size: 16px; color: #fff; background: var(--accent-indigo); flex-shrink: 0; }
       .circle-owned { font-size: 10px; font-weight: 700; color: var(--accent-teal); background: rgba(0,208,160,0.12); border-radius: 999px; padding: 2px 7px; margin-left: 4px; vertical-align: middle; text-transform: uppercase; letter-spacing: 0.03em; }
       .circle-desc { font-size: 11px; color: var(--text-muted); margin-top: 2px; line-height: 1.4; }
+      .community-search { display: flex; align-items: center; gap: 6px; flex: 1; min-width: 200px; color: var(--text-muted); }
+      .community-search .booking-input { flex: 1; }
+      .copy-head { display: flex; align-items: center; gap: 6px; font-weight: 700; font-size: 13px; color: var(--text); }
+      .copy-card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px; margin-bottom: 16px; }
+      .copy-card-head { display: flex; align-items: center; gap: 6px; font-weight: 700; font-size: 13px; color: var(--text); margin-bottom: 10px; }
+      .copy-refresh { margin-left: auto; }
+      .copy-row { display: grid; grid-template-columns: 1fr auto auto; align-items: center; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
+      .copy-row:last-child { border-bottom: none; }
+      .copy-stat { text-align: right; font-size: 13px; font-weight: 700; }
+      .trader-rank { width: 20px; height: 20px; border-radius: 6px; background: var(--accent-indigo); color: #fff; font-size: 11px; font-weight: 800; display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; }
+      .chip-row { display: flex; flex-wrap: wrap; gap: 6px; }
+      .chip { border: 1px solid var(--border); background: transparent; color: var(--text-muted); border-radius: 999px; padding: 3px 10px; font-size: 11px; font-weight: 600; cursor: pointer; font-family: inherit; }
+      .chip:hover { border-color: var(--accent-indigo); color: var(--text); }
+      .chip-on { background: var(--accent-indigo); border-color: var(--accent-indigo); color: #fff; }
+      .stats-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 12px; }
+      .stats-cell { background: var(--card-bg); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; }
+      .stats-cell span { display: block; font-size: 11px; color: var(--text-muted); margin-bottom: 2px; }
+      .stats-cell b { font-size: 15px; }
+      .stats-sub { margin-top: 12px; font-size: 12px; color: var(--text-muted); display: flex; flex-direction: column; gap: 2px; }
+      .stats-sub b { color: var(--text); }
+      .copy-stats-modal { max-width: 420px; width: 100%; }
       .bot-avatar { width: 100%; height: 90px; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-weight: 800; font-size: 30px; color: #fff; background: linear-gradient(135deg, var(--accent-indigo), var(--accent-red)); margin-bottom: 10px; }
       .bot-meta { font-size: 11px; color: var(--text-muted); margin-bottom: 8px; }
       .bot-actions { display: flex; gap: 6px; flex-wrap: wrap; }
@@ -3623,7 +4194,7 @@ function GlobalStyle() {
       .activity-dot-circle_create, .activity-dot-circle_join, .activity-dot-circle_leave { background: var(--accent-indigo); }
       .activity-dot-bot_share, .activity-dot-bot_upload_free { background: var(--accent-red); }
       .activity-dot-bot_use, .activity-dot-bot_run { background: var(--accent-teal); }
-      .activity-dot-copy_strategy_create, .activity-dot-copy_follow, .activity-dot-copy_unfollow { background: #e9c148; }
+      .activity-dot-copy_strategy_create, .activity-dot-copy_follow, .activity-dot-copy_unfollow, .activity-dot-copy_start, .activity-dot-copy_stop { background: #e9c148; }
       .activity-msg { flex: 1; color: var(--text); }
       .activity-time { font-size: 11px; color: var(--text-muted); white-space: nowrap; }
       .roi-up { color: var(--accent-teal); font-weight: 700; }
@@ -3727,6 +4298,8 @@ function GlobalStyle() {
       .mt-open-cell { display: flex; flex-direction: column; gap: 2px; font-size: 11px; color: var(--text-muted); }
       .mt-open-cell b { font-size: 14px; color: var(--text); font-family: 'SFMono-Regular', Consolas, monospace; }
       .mt-bottom-actions { position: sticky; bottom: 0; z-index: 40; display: flex; gap: 10px; background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 10px; box-shadow: 0 -6px 24px rgba(0,0,0,0.12); }
+      .mt-login-bar { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; background: rgba(76,110,245,0.1); border: 1px solid rgba(76,110,245,0.35); color: var(--text); border-radius: 10px; padding: 10px 12px; font-size: 13px; }
+      .mt-login-bar span { display: inline-flex; align-items: center; gap: 6px; }
       .mt-side-btn { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; border: none; border-radius: 12px; padding: 14px 10px; font-weight: 800; font-size: 15px; cursor: pointer; transition: transform 0.12s ease, filter 0.12s ease; }
       .mt-side-btn:hover:not(:disabled) { transform: translateY(-2px); filter: brightness(1.05); }
       .mt-side-btn:disabled { opacity: 0.55; cursor: not-allowed; }
@@ -3859,6 +4432,8 @@ function GlobalStyle() {
         .mt-grid { grid-template-columns: 1fr; }
         .table-card { overflow-x: auto; }
         .table-row { grid-template-columns: minmax(160px, 2fr) 1fr 1fr 0.8fr; min-width: 480px; }
+        .table-row-5 { grid-template-columns: minmax(130px, 1.6fr) 1fr 1fr 1fr 1.2fr; }
+        .mt-active-row { grid-template-columns: minmax(110px, 1.6fr) 1fr 1fr 1fr auto; min-width: 560px; }
       }
 
       @media (max-width: 760px) {

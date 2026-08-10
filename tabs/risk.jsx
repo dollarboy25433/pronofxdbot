@@ -12,7 +12,12 @@ const CALCS = [
   { id: 'martingale', label: 'Martingale', icon: Zap },
 ];
 
-const fmt = (n, d = 2) => (n == null || !isFinite(n) ? '—' : Number(n.toFixed(d)).toLocaleString(undefined, { maximumFractionDigits: d }));
+const fmt = (n, d = 2) => {
+  if (n === undefined || n === null || n === '') return '—';
+  const v = Number(n);
+  if (!isFinite(v)) return '—';
+  return Number(v.toFixed(d)).toLocaleString(undefined, { maximumFractionDigits: d });
+};
 
 function NumField({ label, value, onChange, min, step, hint }) {
   return (

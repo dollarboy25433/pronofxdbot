@@ -146,6 +146,19 @@ CREATE TABLE IF NOT EXISTS copy_follows (
   followed_at TIMESTAMPTZ DEFAULT now(),
   UNIQUE (strategy_id, loginid)
 );
+CREATE TABLE IF NOT EXISTS trade_history (
+  id BIGSERIAL PRIMARY KEY,
+  loginid TEXT,
+  symbol TEXT NOT NULL DEFAULT '',
+  contract_type TEXT NOT NULL DEFAULT '',
+  stake REAL NOT NULL DEFAULT 0,
+  profit REAL NOT NULL DEFAULT 0,
+  payout REAL NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'won',
+  source TEXT NOT NULL DEFAULT 'manual',
+  trade_time TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_trade_history_loginid ON trade_history(loginid, trade_time DESC);
 `;
 
 async function initDb() {
@@ -460,7 +473,6 @@ app.get('/api/contracts_for', async (req, res) => {
   try {
     const result = await derivRequest(ctx.acct.token, {
       contracts_for: symbol,
-      currency: ctx.acct.currency || 'USD',
     }, { label: 'contracts_for', context: { symbol, account: ctx.acct.account } });
     res.json({ contracts_for: result.contracts_for });
   } catch (err) {
@@ -487,7 +499,7 @@ app.post('/api/contract/proposal', async (req, res) => {
       currency: currency || ctx.acct.currency || 'USD',
       duration,
       duration_unit,
-      symbol,
+      underlying_symbol: symbol,
     };
     // Digits (Matches/Differs/Over/Under), Highs/Lows and Ends In/Out carry
     // barriers; Accumulators use a `prediction` instead. Forward them so
@@ -1166,6 +1178,212 @@ app.delete('/api/copy/strategies/:id', async (req, res) => {
   try {
     await db.query('DELETE FROM copy_strategies WHERE id = $1 AND owner_loginid = $2', [Number(req.params.id), loginid]);
     res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------------------------------------------------------------
+// Deriv copy trading (live WS API)
+// Wraps Deriv's copy-trading endpoints (copy_start / copy_stop /
+// copytrading_list / copytrading_statistics / copy_trading_list) over the
+// per-account OTP-authenticated connection. Calls ride the same pooled socket
+// as proposal/buy/sell. Deriv errors (e.g. unsupported on this app/account)
+// are passed through so the UI can surface the real reason.
+
+function normNum(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function normCopyTrader(t) {
+  return {
+    name: t.name || t.display_name || 'Deriv trader',
+    shortName: t.short_name || '',
+    country: t.country || '',
+    token: t.token || null,
+    loginid: t.loginid || t.trader_id || null,
+    monthlyProfit: normNum(t.monthly_profit),
+    monthlyTrades: normNum(t.monthly_trades),
+    profit: normNum(t.profit),
+    loss: normNum(t.loss),
+    followers: normNum(t.followers),
+    activeBots: normNum(t.active_bots),
+    rating: normNum(t.rating),
+    ratingCount: normNum(t.rating_count),
+    creationDate: t.creation_date || null,
+    isFollowing: !!t.is_following,
+    status: t.status || 'active',
+  };
+}
+
+// Traders available to copy (leaderboard).
+app.get('/api/copy/top', async (req, res) => {
+  const ctx = findSession(req, res);
+  if (!ctx) return;
+  try {
+    const result = await derivRequest(
+      ctx.acct.token,
+      { copy_trading_list: 1 },
+      { label: 'copy_trading_list', context: { account: ctx.acct.account } }
+    );
+    const payload = result.copy_trading_list || {};
+    const list = Array.isArray(payload) ? payload : payload.list || payload.traders || [];
+    res.json({ traders: list.map(normCopyTrader) });
+  } catch (err) {
+    apiError(res, 502, err);
+  }
+});
+
+// Detailed statistics for a single trader.
+app.get('/api/copy/statistics', async (req, res) => {
+  const ctx = findSession(req, res);
+  if (!ctx) return;
+  const traderId = String(req.query.trader_id || '').trim();
+  if (!traderId) return res.status(400).json({ error: 'trader_id is required' });
+  try {
+    const result = await derivRequest(
+      ctx.acct.token,
+      { copytrading_statistics: 1, trader_id: traderId },
+      { label: 'copytrading_statistics', context: { account: ctx.acct.account } }
+    );
+    res.json({ statistics: result.copytrading_statistics || {} });
+  } catch (err) {
+    apiError(res, 502, err);
+  }
+});
+
+// Active copy-trading relationships for the account.
+app.get('/api/copy/active', async (req, res) => {
+  const ctx = findSession(req, res);
+  if (!ctx) return;
+  try {
+    const result = await derivRequest(
+      ctx.acct.token,
+      { copytrading_list: 1 },
+      { label: 'copytrading_list', context: { account: ctx.acct.account } }
+    );
+    const payload = result.copytrading_list || {};
+    const list = Array.isArray(payload) ? payload : payload.list || payload.traders || [];
+    res.json({ list });
+  } catch (err) {
+    apiError(res, 502, err);
+  }
+});
+
+// Start copying a trader (share/read-only API token + optional filters).
+app.post('/api/copy/start', async (req, res) => {
+  const ctx = findSession(req, res);
+  if (!ctx) return;
+  const { token, assets, trade_types, min_trade_stake, max_trade_stake } = req.body || {};
+  if (!token) return res.status(400).json({ error: 'Trader token is required' });
+  const payload = { copy_start: String(token) };
+  if (Array.isArray(assets) && assets.length) payload.assets = assets;
+  if (Array.isArray(trade_types) && trade_types.length) payload.trade_types = trade_types;
+  if (min_trade_stake != null && Number(min_trade_stake) > 0) payload.min_trade_stake = Number(min_trade_stake);
+  if (max_trade_stake != null && Number(max_trade_stake) > 0) payload.max_trade_stake = Number(max_trade_stake);
+  try {
+    const result = await derivRequest(ctx.acct.token, payload, {
+      label: 'copy_start',
+      context: { account: ctx.acct.account },
+    });
+    res.json({ ok: true, result });
+  } catch (err) {
+    apiError(res, 502, err);
+  }
+});
+
+// Stop copying a trader.
+app.post('/api/copy/stop', async (req, res) => {
+  const ctx = findSession(req, res);
+  if (!ctx) return;
+  const { token } = req.body || {};
+  if (!token) return res.status(400).json({ error: 'Trader token is required' });
+  try {
+    const result = await derivRequest(ctx.acct.token, { copy_stop: String(token) }, {
+      label: 'copy_stop',
+      context: { account: ctx.acct.account },
+    });
+    res.json({ ok: true, result });
+  } catch (err) {
+    apiError(res, 502, err);
+  }
+});
+
+// ---------------------------------------------------------------
+// Trade history (per-day, PostgreSQL-backed)
+// ---------------------------------------------------------------
+
+// Record a settled trade into the user's daily history (manual + bot).
+app.post('/api/trades/record', async (req, res) => {
+  const loginid = sessionLoginid(req);
+  if (!loginid) return res.status(401).json({ error: 'Not authenticated' });
+  if (!db) return res.status(503).json({ error: 'Database not configured' });
+  const { symbol, contract_type, stake, profit, payout, status, source } = req.body || {};
+  if (!symbol) return res.status(400).json({ error: 'symbol is required' });
+  try {
+    await db.query(
+      'INSERT INTO users (loginid, last_seen_at) VALUES ($1, now()) ON CONFLICT (loginid) DO UPDATE SET last_seen_at = now()',
+      [loginid]
+    );
+    await db.query(
+      `INSERT INTO trade_history (loginid, symbol, contract_type, stake, profit, payout, status, source)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [
+        loginid,
+        String(symbol),
+        String(contract_type || ''),
+        normNum(stake),
+        normNum(profit),
+        normNum(payout),
+        String(status || (normNum(profit) >= 0 ? 'won' : 'lost')),
+        String(source || 'manual'),
+      ]
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Daily trade history: per-day summaries + the most recent trades.
+app.get('/api/trades/history', async (req, res) => {
+  const loginid = sessionLoginid(req);
+  if (!loginid) return res.status(401).json({ error: 'Not authenticated' });
+  if (!db) return res.json({ days: [], recent: [] });
+  const days = Math.min(parseInt(req.query.days || '7', 10) || 7, 90);
+  try {
+    const summary = await db.query(
+      `SELECT to_char(trade_time::date, 'YYYY-MM-DD') AS day,
+              COUNT(*) AS total,
+              COUNT(*) FILTER (WHERE profit >= 0) AS wins,
+              COUNT(*) FILTER (WHERE profit < 0) AS losses,
+              COALESCE(SUM(profit) FILTER (WHERE profit >= 0), 0) AS win_amount,
+              COALESCE(SUM(-profit) FILTER (WHERE profit < 0), 0) AS loss_amount,
+              COALESCE(SUM(profit), 0) AS net
+       FROM trade_history
+       WHERE loginid = $1 AND trade_time >= now() - make_interval(days => $2)
+       GROUP BY trade_time::date ORDER BY trade_time::date DESC`,
+      [loginid, days]
+    );
+    const recent = await db.query(
+      `SELECT id, symbol, contract_type, stake, profit, payout, status, source, trade_time
+       FROM trade_history WHERE loginid = $1
+       ORDER BY trade_time DESC LIMIT 50`,
+      [loginid]
+    );
+    res.json({
+      days: summary.rows.map((r) => ({
+        day: r.day,
+        total: Number(r.total),
+        wins: Number(r.wins),
+        losses: Number(r.losses),
+        winAmount: Number(r.win_amount),
+        lossAmount: Number(r.loss_amount),
+        net: Number(r.net),
+      })),
+      recent: recent.rows.map((r) => ({ ...r })),
+    });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
