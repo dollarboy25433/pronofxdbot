@@ -73,7 +73,15 @@ export default function TradingViewTab({ theme }) {
     setTicks([]);
 
     fetch(`${API_BASE}/api/candles?symbol=${encodeURIComponent(symbol)}&granularity=${granularity}&count=${MAX_CANDLES}`)
-      .then((r) => { if (!r.ok) throw new Error(`Candle request failed (${r.status})`); return r.json(); })
+      .then(async (r) => {
+        if (r.ok) return r.json();
+        let msg = `HTTP ${r.status}`;
+        try {
+          const body = await r.json();
+          if (body && body.error) msg = `${body.error}${body.code ? ` (${body.code})` : ''}`;
+        } catch { /* not json */ }
+        throw new Error(`Candle request failed: ${msg}`);
+      })
       .then((data) => { if (!cancelled) setCandles(data.candles || []); })
       .catch((e) => { if (!cancelled) setCandlesError(e.message); })
       .finally(() => { if (!cancelled) setCandlesLoading(false); });

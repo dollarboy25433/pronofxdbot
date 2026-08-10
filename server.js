@@ -29,6 +29,24 @@ const PORT = process.env.PORT || 4000;
 const DERIV_APP_ID = process.env.DERIV_APP_ID || '126958'; // used for WebSocket/API calls (Deriv-App-ID header + legacy WS)
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
 
+// DERIV_APP_ID must be the *numeric* app id from Deriv's classic app
+// registration (api.deriv.com -> Manage Apps), used as the `app_id` query
+// param on wss://ws.derivws.com. It is easy to confuse with DERIV_CLIENT_ID
+// (the OAuth2 client id from developers.deriv.com), which is a long
+// alphanumeric string and is NOT accepted by that WebSocket endpoint —
+// using it here makes every Deriv API call fail with "InvalidAppID" (seen
+// by clients as a 502 on balance/candles/trading endpoints). Warn loudly
+// at startup so this misconfiguration is obvious instead of showing up as
+// a mysterious 502 later.
+if (!/^\d+$/.test(DERIV_APP_ID)) {
+  console.warn(
+    `[deriv] WARNING: DERIV_APP_ID="${DERIV_APP_ID}" does not look like a numeric Deriv app id. ` +
+    'If this is actually your DERIV_CLIENT_ID (OAuth2), every Deriv API call will fail with ' +
+    '"InvalidAppID". Get a numeric app id from https://api.deriv.com/dashboard and set it as ' +
+    'DERIV_APP_ID separately from DERIV_CLIENT_ID.'
+  );
+}
+
 // ---------------------------------------------------------------
 // PostgreSQL (community data: users, activities, circles, bots,
 // copy-trading strategies). On Render set DATABASE_URL to your
@@ -377,10 +395,10 @@ app.get('/api/balance', async (req, res) => {
   if (!acctData) return res.status(404).json({ error: 'Account not found in session' });
 
   try {
-    const result = await derivRequest(acctData.token, { balance: 1 });
+    const result = await derivRequest(acctData.token, { balance: 1 }, { label: 'balance', context: { account } });
     res.json(result.balance);
   } catch (err) {
-    res.status(502).json({ error: err.message });
+    apiError(res, 502, err);
   }
 });
 
@@ -413,6 +431,15 @@ function findSession(req, res) {
   return { data, acct };
 }
 
+// Standard API error response: always include the deriv error code + details
+// (not just the HTTP status) so failures are diagnosable end-to-end.
+function apiError(res, status, err) {
+  const body = { error: err.message };
+  if (err.code) body.code = err.code;
+  if (err.details) body.details = err.details;
+  res.status(status).json(body);
+}
+
 // Contract types available for a symbol on the logged-in account.
 app.get('/api/contracts_for', async (req, res) => {
   const ctx = findSession(req, res);
@@ -425,10 +452,10 @@ app.get('/api/contracts_for', async (req, res) => {
     const result = await derivRequest(ctx.acct.token, {
       contracts_for: symbol,
       currency: ctx.acct.currency || 'USD',
-    });
+    }, { label: 'contracts_for', context: { symbol, account: ctx.acct.account } });
     res.json({ contracts_for: result.contracts_for });
   } catch (err) {
-    res.status(502).json({ error: err.message });
+    apiError(res, 502, err);
   }
 });
 
@@ -452,10 +479,10 @@ app.post('/api/contract/proposal', async (req, res) => {
       duration,
       duration_unit,
       symbol,
-    });
+    }, { label: 'proposal', context: { symbol, contract_type, account: ctx.acct.account } });
     res.json({ proposal: result.proposal });
   } catch (err) {
-    res.status(502).json({ error: err.message });
+    apiError(res, 502, err);
   }
 });
 
@@ -470,10 +497,10 @@ app.post('/api/contract/buy', async (req, res) => {
   }
 
   try {
-    const result = await derivRequest(ctx.acct.token, { buy: proposal_id, price });
+    const result = await derivRequest(ctx.acct.token, { buy: proposal_id, price }, { label: 'buy', context: { account: ctx.acct.account } });
     res.json({ buy: result.buy });
   } catch (err) {
-    res.status(502).json({ error: err.message });
+    apiError(res, 502, err);
   }
 });
 
@@ -488,10 +515,10 @@ app.post('/api/contract/sell', async (req, res) => {
   }
 
   try {
-    const result = await derivRequest(ctx.acct.token, { sell: contract_id, price });
+    const result = await derivRequest(ctx.acct.token, { sell: contract_id, price }, { label: 'sell', context: { account: ctx.acct.account } });
     res.json({ sell: result.sell });
   } catch (err) {
-    res.status(502).json({ error: err.message });
+    apiError(res, 502, err);
   }
 });
 
@@ -501,10 +528,10 @@ app.get('/api/contract/open', async (req, res) => {
   if (!ctx) return;
 
   try {
-    const result = await derivRequest(ctx.acct.token, { portfolio: 1 });
+    const result = await derivRequest(ctx.acct.token, { portfolio: 1 }, { label: 'portfolio', context: { account: ctx.acct.account } });
     res.json({ contracts: (result.portfolio && result.portfolio.contracts) || [] });
   } catch (err) {
-    res.status(502).json({ error: err.message });
+    apiError(res, 502, err);
   }
 });
 
@@ -574,78 +601,246 @@ app.post('/api/cashier/verify-email', async (req, res) => {
   }
 });
 
-// --- Helper: open a short-lived WS connection, send one request ---
-// Pass a token to authorize first (account data). Pass `null` for public
-// endpoints (ticks_history, active_symbols) that do not require a token.
-function derivRequest(token, request) {
-  return new Promise((resolve, reject) => {
-    const ws = new WebSocket(`wss://ws.derivws.com/websockets/v3?app_id=${DERIV_APP_ID}`);
+// --- Deriv diagnostic logging ---
+// One-line JSON per entry so Render's console stays greppable. `kind`
+// names the failure (RETRY, FAIL, DERIV_ERROR, STREAM_STATUS, ...) and
+// `extra` carries the request context (route, symbol, account, code).
+function derivLog(level, kind, msg, extra = {}) {
+  const entry = JSON.stringify({ ts: new Date().toISOString(), kind, msg, ...extra });
+  const line = `[deriv] ${entry}`;
+  if (level === 'error') console.error(line);
+  else if (level === 'warn') console.warn(line);
+  else console.log(line);
+}
 
-    const timeout = setTimeout(() => {
-      ws.close();
-      reject(new Error('Deriv API request timed out'));
-    }, 10000);
-
-    ws.on('open', () => {
-      if (token) ws.send(JSON.stringify({ authorize: token }));
-      else ws.send(JSON.stringify(request));
+// Read the body of a rejected WS upgrade. Deriv explains HTTP statuses like
+// the 401 rate-limit in the upgrade response body — status alone isn't enough.
+function readUpgradeBody(res) {
+  return new Promise((resolve) => {
+    let body = '';
+    res.on('data', (chunk) => {
+      body += chunk;
+      if (body.length > 1000) res.destroy();
     });
-
-    ws.on('message', (msg) => {
-      const response = JSON.parse(msg);
-
-      if (response.error) {
-        clearTimeout(timeout);
-        ws.close();
-        const err = new Error(response.error.message);
-        err.code = response.error.code;
-        err.details = response.error.details;
-        return reject(err);
-      }
-
-      if (response.msg_type === 'authorize') {
-        ws.send(JSON.stringify(request));
-      } else {
-        clearTimeout(timeout);
-        ws.close();
-        resolve(response);
-      }
-    });
-
-    ws.on('error', (err) => {
-      clearTimeout(timeout);
-      reject(err);
-    });
+    res.on('end', () => resolve(body));
+    res.on('error', () => resolve(body));
   });
 }
 
-// --- Helper: open a WS, authorize with a token, resolve with the authorize result ---
-function authorizeInfo(token) {
-  return new Promise((resolve, reject) => {
-    const ws = new WebSocket(`wss://ws.derivws.com/websockets/v3?app_id=${DERIV_APP_ID}`);
-    const timeout = setTimeout(() => {
-      ws.close();
-      reject(new Error('authorize timed out'));
-    }, 10000);
+// Default request label: the Deriv msg_type key(s) of the request.
+const derivCtx = (request) => Object.keys(request).filter((k) => k !== 'req_id').join(',');
 
-    ws.on('open', () => ws.send(JSON.stringify({ authorize: token })));
-    ws.on('message', (msg) => {
-      const response = JSON.parse(msg);
+// ---------------------------------------------------------------
+// Deriv WS connection pool
+// ---------------------------------------------------------------
+// Deriv rate-limits shared/test app ids (esp. from datacenter IPs like
+// Render) by answering WS upgrades with an HTTP 401 when too many
+// connections arrive in a short burst. Opening a brand-new WebSocket
+// (and, when authenticated, a fresh `authorize` handshake) for every
+// single API call — accounts, balance, contracts_for, proposal, buy —
+// multiplies that risk and is the most common cause of the 502s users
+// see when loading the wallet balance. Instead we keep one connection
+// per Deriv API token (plus one shared connection for public,
+// token-less requests) open for a short idle window and multiplex
+// every request over it using `req_id`, so a page load that fires off
+// several API calls back-to-back reuses a single WS handshake.
+const derivPool = new Map(); // key -> pool entry
+let derivReqSeq = 1;
+const DERIV_POOL_IDLE_MS = 30000;
+const DERIV_REQUEST_TIMEOUT_MS = 10000;
+
+function poolKey(token) {
+  return token || '__public__';
+}
+
+// Connection-level failures (bad handshake, timeout, socket error) are
+// safe to retry with a fresh connection. Genuine Deriv API errors
+// (InvalidToken, RateLimit, ContractBuyValidationError, ...) are not.
+function isRetryableCode(code) {
+  return code === 'TIMEOUT' || code === 'CONNECT' || (typeof code === 'string' && code.startsWith('WS_HTTP_'));
+}
+
+function closePoolEntry(key, err) {
+  const entry = derivPool.get(key);
+  if (!entry || entry.closed) return;
+  entry.closed = true;
+  derivPool.delete(key);
+  clearTimeout(entry.idleTimer);
+  const closeErr = err || Object.assign(new Error('Deriv connection closed'), { code: 'CONNECT' });
+  if (entry.readyReject) entry.readyReject(closeErr);
+  for (const waiter of entry.pending.values()) waiter.reject(closeErr);
+  entry.pending.clear();
+  try { entry.ws.close(); } catch { /* noop */ }
+}
+
+function touchPoolEntry(entry, key) {
+  clearTimeout(entry.idleTimer);
+  entry.idleTimer = setTimeout(() => closePoolEntry(key), DERIV_POOL_IDLE_MS);
+}
+
+function openPoolConnection(token, key) {
+  const entry = {
+    ws: new WebSocket(`wss://ws.derivws.com/websockets/v3?app_id=${DERIV_APP_ID}`),
+    authorized: !token,
+    authorizeResult: null,
+    pending: new Map(),
+    idleTimer: null,
+    closed: false,
+    readyResolve: null,
+    readyReject: null,
+  };
+  entry.ready = new Promise((resolve, reject) => {
+    entry.readyResolve = resolve;
+    entry.readyReject = reject;
+  });
+  const { ws } = entry;
+
+  ws.on('open', () => {
+    if (token) ws.send(JSON.stringify({ authorize: token, req_id: 0 }));
+    else entry.readyResolve();
+  });
+
+  ws.on('message', (msg) => {
+    let response;
+    try { response = JSON.parse(msg); } catch { return; }
+
+    if (response.req_id === 0) {
+      // authorize handshake response
       if (response.error) {
-        clearTimeout(timeout);
-        ws.close();
-        return reject(new Error(response.error.message));
+        const err = new Error(response.error.message);
+        err.code = response.error.code;
+        err.details = response.error.details;
+        entry.readyReject(err);
+        closePoolEntry(key, err);
+      } else {
+        entry.authorized = true;
+        entry.authorizeResult = response;
+        entry.readyResolve();
       }
-      if (response.msg_type === 'authorize') {
-        clearTimeout(timeout);
-        ws.close();
-        resolve(response);
-      }
+      return;
+    }
+
+    const waiter = response.req_id != null ? entry.pending.get(response.req_id) : null;
+    if (!waiter) return; // unmatched/unsolicited push — ignore here
+    entry.pending.delete(response.req_id);
+    if (response.error) {
+      const err = new Error(response.error.message);
+      err.code = response.error.code;
+      err.details = response.error.details;
+      waiter.reject(err);
+    } else {
+      waiter.resolve(response);
+    }
+  });
+
+  ws.on('unexpected-response', (req, res) => {
+    readUpgradeBody(res).then((body) => {
+      const err = new Error(`Deriv WS upgrade rejected with HTTP ${res.statusCode}`);
+      err.code = `WS_HTTP_${res.statusCode}`;
+      err.details = body.slice(0, 1000) || null;
+      closePoolEntry(key, err);
     });
-    ws.on('error', (err) => {
+  });
+
+  ws.on('error', (err) => {
+    closePoolEntry(key, Object.assign(new Error(err.message), { code: 'CONNECT' }));
+  });
+
+  ws.on('close', () => closePoolEntry(key));
+
+  derivPool.set(key, entry);
+  return entry;
+}
+
+async function getPoolConnection(token) {
+  const key = poolKey(token);
+  let entry = derivPool.get(key);
+  if (!entry || entry.closed || entry.ws.readyState > WebSocket.OPEN) {
+    entry = openPoolConnection(token, key);
+  }
+  await entry.ready;
+  touchPoolEntry(entry, key);
+  return entry;
+}
+
+function sendPooled(entry, request) {
+  return new Promise((resolve, reject) => {
+    const reqId = derivReqSeq++;
+    const timeout = setTimeout(() => {
+      entry.pending.delete(reqId);
+      reject(Object.assign(new Error('Deriv API request timed out'), { code: 'TIMEOUT' }));
+    }, DERIV_REQUEST_TIMEOUT_MS);
+    entry.pending.set(reqId, {
+      resolve: (v) => { clearTimeout(timeout); resolve(v); },
+      reject: (e) => { clearTimeout(timeout); reject(e); },
+    });
+    try {
+      entry.ws.send(JSON.stringify({ ...request, req_id: reqId }));
+    } catch (err) {
       clearTimeout(timeout);
+      entry.pending.delete(reqId);
       reject(err);
+    }
+  });
+}
+
+// --- Send one request over a pooled, reused Deriv WS connection ---
+// Pass a token to authorize first (account data). Pass `null` for public
+// endpoints (ticks_history, active_symbols) that do not require a token.
+// Connection-level failures are retried with a short backoff and every
+// attempt is logged with the server's rejection body so the underlying
+// reason is visible in the logs (and not just a generic 502 downstream).
+async function derivRequest(token, request, ctx = {}) {
+  const { label = derivCtx(request), context = {}, attempts = 3 } = ctx;
+  const logExtra = { label, ...context };
+  let lastErr = null;
+
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      const entry = await getPoolConnection(token);
+      const response = await sendPooled(entry, request);
+      if (attempt > 1) derivLog('warn', 'RETRIED_OK', 'succeeded after retries', { ...logExtra, attempt });
+      return response;
+    } catch (err) {
+      lastErr = err;
+      const retryable = isRetryableCode(err.code);
+      const extra = { ...logExtra, attempt, of: attempts, code: err.code || null, details: err.details || err.message };
+      if (!retryable) {
+        derivLog('error', 'DERIV_ERROR', err.message, extra);
+        throw err;
+      }
+      if (attempt >= attempts) {
+        derivLog('error', 'FAIL', `giving up: ${err.message}`, extra);
+        throw err;
+      }
+      derivLog('warn', 'RETRY', 'retrying after connection-level failure', extra);
+      await new Promise((r) => setTimeout(r, 300 * attempt + Math.floor(Math.random() * 200)));
+    }
+  }
+  throw lastErr;
+}
+
+// --- Authorize a token and return the `authorize` response, reusing the pool ---
+async function authorizeInfo(token, ctx = {}) {
+  const entry = await getPoolConnection(token);
+  return entry.authorizeResult || { authorize: {} };
+}
+
+// Attach diagnostics to the long-lived streams (tick/contract/balance):
+// log the upgrade rejection status+body and socket errors with context,
+// without touching the existing reconnect/close handling.
+function attachStreamDiag(ws, kind, context = {}) {
+  ws.on('unexpected-response', (req, res) => {
+    readUpgradeBody(res).then((body) => {
+      derivLog('error', 'STREAM_STATUS', `WS upgrade rejected for ${kind}`, {
+        ...context,
+        code: `WS_HTTP_${res.statusCode}`,
+        details: body.slice(0, 1000) || null,
+      });
     });
+  });
+  ws.on('error', (err) => {
+    derivLog('error', 'STREAM_ERROR', `${kind}: ${err.message}`, context);
   });
 }
 
@@ -1060,33 +1255,71 @@ const CANDIDATE_SYMBOLS = [
 
 // Probe a list of symbols with a single WS connection; returns the ones that
 // actually answer for this app id. Used when active_symbols is unavailable.
+// NOTE: `ticks_history` with `style: 'candles'` answers with `msg_type: 'candles'`
+// (NOT 'history'), so both shapes are accepted. Retries on connection errors
+// (Deriv's shared test app ids occasionally answer the WS upgrade with a 401).
 function probeAvailableSymbols(candidates) {
   return new Promise((resolve, reject) => {
-    const ws = new WebSocket(DERIV_TICK_WS);
     const valid = [];
     let index = 0;
+    let attempts = 3;
+    let ws;
 
-    const timeout = setTimeout(() => { ws.close(); resolve(valid); }, 20000);
+    const cleanup = () => { try { ws.close(); } catch { /* noop */ } };
 
-    ws.on('open', () => ws.send(JSON.stringify({ ticks_history: candidates[0][0], count: 1, end: 'latest', granularity: 60, style: 'candles' })));
-
-    ws.on('message', (msg) => {
-      let response;
-      try { response = JSON.parse(msg); } catch { return; }
-      if (response.msg_type === 'history' && response.candles) {
-        valid.push(candidates[index]);
-      }
-      index += 1;
-      if (index >= candidates.length) {
-        clearTimeout(timeout);
-        ws.close();
-        resolve(valid);
-      } else {
+    const tryConnect = () => {
+      ws = new WebSocket(DERIV_TICK_WS);
+      const timeout = setTimeout(() => { cleanup(); resolve(valid); }, 20000);
+      ws.on('open', () => {
         ws.send(JSON.stringify({ ticks_history: candidates[index][0], count: 1, end: 'latest', granularity: 60, style: 'candles' }));
-      }
-    });
+      });
+      ws.on('message', (msg) => {
+        let response;
+        try { response = JSON.parse(msg); } catch { return; }
+        const candleOk = response.msg_type === 'candles' && response.candles && response.candles.length > 0;
+        const historyOk = response.msg_type === 'history' && response.history && response.history.prices && response.history.prices.length > 0;
+        if (candleOk || historyOk) valid.push(candidates[index]);
+        index += 1;
+        if (index >= candidates.length) {
+          clearTimeout(timeout);
+          cleanup();
+          resolve(valid);
+        } else {
+          ws.send(JSON.stringify({ ticks_history: candidates[index][0], count: 1, end: 'latest', granularity: 60, style: 'candles' }));
+        }
+      });
+      ws.on('unexpected-response', (req, res) => {
+        readUpgradeBody(res).then((body) => {
+          derivLog('error', 'STREAM_STATUS', 'WS upgrade rejected during symbol probe', {
+            code: `WS_HTTP_${res.statusCode}`,
+            details: body.slice(0, 1000) || null,
+            candidate: candidates[index] ? candidates[index][0] : null,
+            index,
+            of: candidates.length,
+          });
+          clearTimeout(timeout);
+          cleanup();
+          attempts -= 1;
+          if (attempts > 0 && index < candidates.length) {
+            setTimeout(tryConnect, 2000 * (3 - attempts));
+          } else {
+            reject(new Error(`WS probe connection failed after ${3 - attempts} attempt(s)`));
+          }
+        });
+      });
+      ws.on('error', () => {
+        clearTimeout(timeout);
+        cleanup();
+        attempts -= 1;
+        if (attempts > 0 && index < candidates.length) {
+          setTimeout(tryConnect, 2000 * (3 - attempts));
+        } else {
+          reject(new Error(`WS probe connection failed after ${3 - attempts} attempt(s)`));
+        }
+      });
+    };
 
-    ws.on('error', (err) => { clearTimeout(timeout); ws.close(); reject(err); });
+    tryConnect();
   });
 }
 
@@ -1134,7 +1367,7 @@ async function buildSymbolCatalog() {
       }));
       mode = 'probe';
     } catch (probeErr) {
-      console.error(`[symbols] probe failed: ${probeErr.message}`);
+      console.error(`[symbols] probe failed: ${probeErr.message}`, probeErr.code ? `code=${probeErr.code}` : '', probeErr.details ? `details=${probeErr.details}` : '');
     }
   }
 
@@ -1183,7 +1416,7 @@ app.get('/api/candles', async (req, res) => {
       end: 'latest',
       granularity: gran,
       style: 'candles',
-    });
+    }, { label: 'candles', context: { symbol, granularity: gran, count: n } });
 
     const candles = (result.candles || []).map((c) => ({
       t: c.epoch * 1000,
@@ -1196,7 +1429,7 @@ app.get('/api/candles', async (req, res) => {
 
     res.json({ symbol, granularity: gran, candles });
   } catch (err) {
-    res.status(502).json({ error: err.message });
+    apiError(res, 502, err);
   }
 });
 
@@ -1217,6 +1450,8 @@ app.get('/api/candles', async (req, res) => {
 const DERIV_TICK_WS = `wss://ws.derivws.com/websockets/v3?app_id=${DERIV_APP_ID}`;
 const tickStreams = new Map(); // symbol -> stream object
 
+let tickPollReqSeq = 1;
+
 function getTickStream(symbol) {
   let stream = tickStreams.get(symbol);
   if (stream) return stream;
@@ -1232,6 +1467,11 @@ function getTickStream(symbol) {
     pollInFlight: false,
     granularity: 60,       // candle bucket width in seconds (clients may change it)
     candle: null,          // forming candle for stream-mode ohlc aggregation
+    // Deriv requires req_id to be an integer (a string like `th:${symbol}`
+    // is rejected with InputValidationFailed) — use unique integers per
+    // stream so poll responses can be matched to the right request.
+    thReqId: tickPollReqSeq++,
+    ocReqId: tickPollReqSeq++,
   };
   tickStreams.set(symbol, stream);
 
@@ -1290,7 +1530,7 @@ function getTickStream(symbol) {
       end: 'latest',
       adjust_start_time: 1,
       style: 'ticks',
-      req_id: `th:${symbol}`,
+      req_id: stream.thReqId,
     }));
     stream.ws.send(JSON.stringify({
       ticks_history: symbol,
@@ -1299,7 +1539,7 @@ function getTickStream(symbol) {
       adjust_start_time: 1,
       granularity: stream.granularity,
       style: 'candles',
-      req_id: `oc:${symbol}`,
+      req_id: stream.ocReqId,
     }));
   };
 
@@ -1321,6 +1561,7 @@ function getTickStream(symbol) {
   const connect = () => {
     if (stream.ws) { try { stream.ws.close(); } catch { /* noop */ } stream.ws = null; }
     stream.ws = new WebSocket(DERIV_TICK_WS);
+    attachStreamDiag(stream.ws, 'tick', { symbol });
     stream.ws.on('open', () => {
       stream.retry = 0;
       if (stream.mode === 'poll') {
@@ -1332,20 +1573,32 @@ function getTickStream(symbol) {
     stream.ws.on('message', (msg) => {
       let parsed;
       try { parsed = JSON.parse(msg); } catch { return; }
+
       if (parsed.msg_type === 'tick') {
         const t = parsed.tick;
         if (t && t.symbol === symbol) {
           // real streaming tick
           handleTick(t.quote, t.epoch);
         } else if (stream.mode === 'stream') {
+          // Shared/throttled app ids reject `ticks subscribe` outright
+          // (e.g. InvalidSymbol) instead of the empty placeholder this
+          // used to check for. Either way, fall back to polling.
           stream.emptyTicks += 1;
           if (stream.emptyTicks >= 1) enterPollMode();
         }
-      } else if (parsed.msg_type === 'history') {
-        if (parsed.req_id !== `th:${symbol}`) return;
+        return;
+      }
+
+      // Poll responses are matched by req_id (Deriv echoes it back), not by
+      // msg_type — a rejected poll request also echoes our req_id but with
+      // msg_type set to the request's own key (e.g. 'ticks_history') plus
+      // an `error` field, so matching by req_id first catches that too and
+      // avoids leaving pollInFlight stuck forever.
+      if (parsed.req_id === stream.thReqId) {
         stream.pollInFlight = false;
+        if (parsed.error) { handleError(parsed.error); return; }
         const h = parsed.history;
-        if (h && h.prices && h.times) {
+        if (h && h.prices && h.times && h.prices.length) {
           for (let i = 0; i < h.prices.length; i++) {
             handleTick(h.prices[i], h.times[i]);
           }
@@ -1353,9 +1606,12 @@ function getTickStream(symbol) {
           // no ticks — market may be closed; signal it once
           broadcast({ msg_type: 'market_status', symbol, marketClosed: true, code: 'MarketIsClosed', message: `Market is closed for ${symbol}.` });
         }
-      } else if (parsed.msg_type === 'candles') {
-        if (parsed.req_id !== `oc:${symbol}`) return;
+        return;
+      }
+
+      if (parsed.req_id === stream.ocReqId) {
         stream.pollInFlight = false;
+        if (parsed.error) { handleError(parsed.error); return; }
         const list = parsed.candles || [];
         if (list.length === 0) return;
         // the last candle is the currently forming one; push its latest OHLC
@@ -1375,7 +1631,10 @@ function getTickStream(symbol) {
             },
           });
         }
-      } else if (parsed.msg_type === 'error') {
+        return;
+      }
+
+      if (parsed.msg_type === 'error') {
         stream.pollInFlight = false;
         handleError(parsed.error);
         if (stream.mode === 'stream') enterPollMode();
@@ -1437,6 +1696,7 @@ function getContractStream(token, contractId) {
 
   const connect = () => {
     stream.ws = new WebSocket(DERIV_TICK_WS);
+    attachStreamDiag(stream.ws, 'contract', { contractId });
     stream.ws.on('open', () => {
       stream.retry = 0;
       stream.ws.send(JSON.stringify({ authorize: token }));
@@ -1497,6 +1757,7 @@ function getBalanceStream(token) {
 
   const connect = () => {
     stream.ws = new WebSocket(DERIV_TICK_WS);
+    attachStreamDiag(stream.ws, 'balance', {});
     stream.ws.on('open', () => {
       stream.retry = 0;
       stream.ws.send(JSON.stringify({ authorize: token }));
