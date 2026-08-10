@@ -338,10 +338,16 @@ async function accountsFromToken(token) {
       const list = Array.isArray(data)
         ? data
         : (data.accounts || data.data || data.list || []);
+      // The OAuth2 access token authorizes every account linked to this
+      // Deriv user, not just the default one — attach it to every entry so
+      // downstream WS calls (balance, proposal, buy, sell, ...) can
+      // actually authorize instead of silently going out unauthenticated
+      // (which Deriv rejects, surfacing as a 502 on the client).
       const accounts = list
         .map((a) => ({
           account: a.loginid || a.account_id || a.account || a.id,
           currency: a.currency || a.currency_code || 'USD',
+          token,
         }))
         .filter((a) => a.account);
       if (accounts.length > 0) return accounts;
