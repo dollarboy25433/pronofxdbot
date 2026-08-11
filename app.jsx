@@ -3259,18 +3259,6 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
         </div>
       )}
 
-      {contractMeta && (
-        <div className="card mt-open-card">
-          <div className="card-label">Open contract · {typeLabel(contractMeta.contract_type)}</div>
-          <div className="mt-open-grid">
-            <div className="mt-open-cell"><span>Entry</span><b>{contract?.entry_spot == null ? '—' : contract.entry_spot.toLocaleString(undefined, { maximumFractionDigits: decimals })}</b></div>
-            <div className="mt-open-cell"><span>Current</span><b>{contract?.current_spot == null ? '—' : contract.current_spot.toLocaleString(undefined, { maximumFractionDigits: decimals })}</b></div>
-            <div className="mt-open-cell"><span>Sell now at</span><b>{contract?.sell_price == null ? '—' : contract.sell_price.toLocaleString(undefined, { maximumFractionDigits: decimals })}</b></div>
-            <div className="mt-open-cell"><span>Potential payout</span><b>{contractMeta.payout != null ? contractMeta.payout.toLocaleString(undefined, { maximumFractionDigits: 2 }) : '—'} {currency}</b></div>
-          </div>
-        </div>
-      )}
-
       {!authenticated && (
         <div className="mt-login-bar">
           <span><AlertTriangle size={13} /> Log in with your Deriv account to place trades — the settings below are live for browsing.</span>
@@ -3969,9 +3957,9 @@ function GlobalStyle() {
       .auth-error { background: #3a1a1a; color: #ff8080; padding: 10px 20px; font-size: 13px; }
 
       .topnav { border-bottom: 1px solid var(--border); background: var(--panel); position: sticky; top: 0; z-index: 10; }
-      .topnav-row { display: flex; align-items: center; justify-content: space-between; padding: 12px 20px; }
+      .topnav-row { display: flex; align-items: center; justify-content: space-between; padding: 12px 20px; min-height: clamp(52px, 7vh, 72px); }
       .brand { display: flex; align-items: center; gap: 8px; }
-      .brand-mark { width: 30px; height: 30px; border-radius: 8px; background: var(--accent-red); display: flex; align-items: center; justify-content: center; font-weight: 800; font-size: 15px; }
+      .brand-mark { width: clamp(28px, 3.6vh, 34px); height: clamp(28px, 3.6vh, 34px); border-radius: 8px; background: var(--accent-red); display: flex; align-items: center; justify-content: center; font-weight: 800; font-size: 15px; }
       .brand-name { font-weight: 700; font-size: 17px; letter-spacing: -0.02em; }
       .brand-badge { font-size: 10px; color: var(--text-muted); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; }
       .topnav-actions { display: flex; align-items: center; gap: 10px; }
@@ -3982,7 +3970,7 @@ function GlobalStyle() {
       .theme-opt:hover { background: var(--panel-2); color: var(--text); }
       .theme-opt-active { color: var(--accent-red); background: rgba(255,68,79,0.1); }
 
-      .tabs { display: flex; gap: 4px; padding: 0 14px 10px; overflow-x: auto; }
+      .tabs { display: flex; align-items: center; gap: 4px; padding: 6px 14px 10px; overflow-x: auto; min-height: clamp(46px, 6vh, 60px); }
       .tab { display: flex; align-items: center; gap: 6px; background: transparent; border: none; color: var(--text-muted); padding: 8px 12px; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; white-space: nowrap; }
       .tab-label { display: inline; }
       .tab:hover { background: var(--panel-2); color: var(--text); }
@@ -3993,7 +3981,7 @@ function GlobalStyle() {
       .btn-outline { background: transparent; color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 8px 14px; font-size: 13px; cursor: pointer; }
       .btn-outline:hover { border-color: var(--accent-red); color: var(--accent-red); }
       .btn-small { padding: 5px 10px; font-size: 12px; }
-      .btn-icon { background: var(--panel-2); border: 1px solid var(--border); color: var(--text-muted); border-radius: 8px; width: 34px; height: 34px; display: flex; align-items: center; justify-content: center; cursor: pointer; }
+      .btn-icon { background: var(--panel-2); border: 1px solid var(--border); color: var(--text-muted); border-radius: 8px; width: clamp(32px, 4vh, 38px); height: clamp(32px, 4vh, 38px); display: flex; align-items: center; justify-content: center; cursor: pointer; }
 
       .body { display: flex; align-items: flex-start; }
       .main { flex: 1; min-width: 0; padding: 24px; }
@@ -4265,9 +4253,6 @@ function GlobalStyle() {
       .mt-evenodd-fill { height: 100%; border-radius: 999px; background: linear-gradient(90deg, var(--accent-teal), var(--accent-indigo)); transition: width 0.4s ease; }
       .mt-evenodd-labels { display: flex; justify-content: space-between; font-size: 11px; font-weight: 600; }
       .mt-open-card { display: flex; flex-direction: column; gap: 10px; }
-      .mt-open-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; }
-      .mt-open-cell { display: flex; flex-direction: column; gap: 2px; font-size: 11px; color: var(--text-muted); }
-      .mt-open-cell b { font-size: 14px; color: var(--text); font-family: 'SFMono-Regular', Consolas, monospace; }
       .mt-bottom-actions { position: sticky; bottom: 0; z-index: 40; display: flex; gap: 10px; background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 10px; box-shadow: 0 -6px 24px rgba(0,0,0,0.12); }
       .mt-login-bar { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; background: rgba(76,110,245,0.1); border: 1px solid rgba(76,110,245,0.35); color: var(--text); border-radius: 10px; padding: 10px 12px; font-size: 13px; }
       .mt-login-bar span { display: inline-flex; align-items: center; gap: 6px; }
@@ -4415,13 +4400,13 @@ function GlobalStyle() {
       }
 
       @media (max-width: 640px) {
-        .topnav-row { padding: 10px 14px; }
+        .topnav-row { padding: 10px 14px; min-height: clamp(46px, 7vh, 62px); }
         .brand-mark { width: 26px; height: 26px; font-size: 13px; }
         .brand-name { font-size: 15px; }
         .brand-badge { display: none; }
         .main { padding: 14px; }
         .section-title { font-size: 18px; }
-        .tabs { padding: 0 10px 8px; }
+        .tabs { padding: 4px 10px 8px; min-height: clamp(42px, 6vh, 54px); }
         .tab { padding: 7px 10px; font-size: 12px; }
         .promo-card { flex-basis: 260px; }
         .promo-img { height: 130px; }

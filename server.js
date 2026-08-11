@@ -190,6 +190,9 @@ const DERIV_AUTH_BASE = 'https://auth.deriv.com';
 const DERIV_REST_BASE = 'https://api.derivws.com/trading/v1';
 // Public (token-less) market-data endpoint: active_symbols, ticks_history, ...
 const DERIV_WS_PUBLIC = `${DERIV_REST_BASE}/options/ws/public`;
+// Deriv's classic WebSocket endpoint (authorize + one-shot calls). The new
+// trading gateway has no `cashier` API, so the cashier routes use this.
+const DERIV_WS_CLASSIC = `wss://ws.derivws.com/websockets/v3?app_id=${DERIV_APP_ID}`;
 
 const DIST_DIR = path.join(process.cwd(), 'dist');
 
@@ -596,7 +599,7 @@ app.post('/api/cashier', async (req, res) => {
   }
 
   try {
-    const result = await derivRequest(ctx.acct.token, payload, { context: { account: ctx.acct.account } });
+    const result = await classicRequest(ctx.acct.token, payload);
     const info = result.cashier;
     const url = typeof info === 'string' ? info : (info && (info.url || info.cashier_url)) || null;
     if (!url) {
@@ -619,10 +622,10 @@ app.post('/api/cashier/verify-email', async (req, res) => {
 
   const { type = 'withdraw' } = req.body || {};
   try {
-    const settings = await derivRequest(ctx.acct.token, { get_settings: 1 }, { context: { account: ctx.acct.account } });
+    const settings = await classicRequest(ctx.acct.token, { get_settings: 1 });
     const email = settings.get_settings && settings.get_settings.email;
     if (!email) return res.status(502).json({ error: 'Could not read the account email from Deriv.' });
-    await derivRequest(ctx.acct.token, { verify_email: email, type }, { context: { account: ctx.acct.account } });
+    await classicRequest(ctx.acct.token, { verify_email: email, type });
     res.json({ ok: true, email });
   } catch (err) {
     res.status(502).json({ error: err.message, code: err.code });
@@ -852,6 +855,58 @@ async function derivRequest(token, request, ctx = {}) {
     }
   }
   throw lastErr;
+}
+
+// --- One-shot request over Deriv's classic WebSocket ---
+// The newer OTP trading gateway (api.derivws.com/trading/v1) does not expose
+// the `cashier` API — its published schemas only cover trading, balance and
+// payment-agent calls. Deriv's classic endpoint still accepts the OAuth2
+// access token via `authorize`, and it is the only place the hosted cashier
+// URL (deposit/withdraw iframe) can be obtained, so the cashier routes talk
+// to it directly on a throwaway connection.
+function classicRequest(token, request) {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(DERIV_WS_CLASSIC);
+    const timeout = setTimeout(() => {
+      try { ws.close(); } catch { /* noop */ }
+      reject(Object.assign(new Error('Deriv API request timed out'), { code: 'TIMEOUT' }));
+    }, 15000);
+    let authorized = !token;
+
+    ws.on('open', () => {
+      if (!authorized) ws.send(JSON.stringify({ authorize: token }));
+      else ws.send(JSON.stringify(request));
+    });
+
+    ws.on('message', (msg) => {
+      let response;
+      try { response = JSON.parse(msg); } catch { return; }
+
+      if (response.error) {
+        clearTimeout(timeout);
+        try { ws.close(); } catch { /* noop */ }
+        const err = new Error(response.error.message);
+        err.code = response.error.code;
+        err.details = response.error.details;
+        return reject(err);
+      }
+
+      if (response.msg_type === 'authorize') {
+        authorized = true;
+        ws.send(JSON.stringify(request));
+        return;
+      }
+
+      clearTimeout(timeout);
+      try { ws.close(); } catch { /* noop */ }
+      resolve(response);
+    });
+
+    ws.on('error', (err) => {
+      clearTimeout(timeout);
+      reject(Object.assign(new Error(err.message), { code: 'CONNECT' }));
+    });
+  });
 }
 
 // Attach diagnostics to the long-lived streams (tick/contract/balance):
