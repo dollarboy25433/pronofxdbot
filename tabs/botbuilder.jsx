@@ -218,6 +218,10 @@ export default function BotBuilderTab({ sessionId, accounts, selectedAccount, se
 
   // --- helpers ---
   const addLog = (type, msg) => setLogs((prev) => [...prev.slice(-200), { type, msg, at: new Date().toLocaleTimeString() }]);
+  const logRef = useRef(null);
+  useEffect(() => {
+    if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
+  }, [logs]);
   const sleep = (ms) => new Promise((resolve) => {
     const started = Date.now();
     const t = setInterval(() => {
@@ -619,7 +623,7 @@ export default function BotBuilderTab({ sessionId, accounts, selectedAccount, se
           <div className="bb-stat"><span>Total stake</span><b>{stats.totalStake.toFixed(2)} {currency}</b></div>
           <div className="bb-stat"><span>P/L</span><b className={stats.profitLoss >= 0 ? 'roi-up' : 'roi-down'}>{stats.profitLoss >= 0 ? '+' : ''}{stats.profitLoss.toFixed(2)} {currency}</b></div>
         </div>
-        <div className="bb-log">
+        <div className="bb-log" ref={logRef}>
           {logs.length === 0 ? (
             <div className="bb-log-empty">Run the bot to see a live log here.</div>
           ) : (
