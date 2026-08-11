@@ -2491,7 +2491,6 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
   const [contract, setContract] = useState(null); // latest proposal_open_contract
   const [contractMeta, setContractMeta] = useState(null); // buy response + proposal meta
   const [busy, setBusy] = useState(false);
-  const [selling, setSelling] = useState(false);
   const [actionError, setActionError] = useState(null);
   const [result, setResult] = useState(null);
 
@@ -2532,6 +2531,18 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
 
   useEffect(() => { contractMetaRef.current = contractMeta; }, [contractMeta]);
   useEffect(() => { contractIdRef.current = contractMeta?.contract_id ?? null; }, [contractMeta]);
+
+  // Live P/L for an open trade. Uses the real "sell now" price when Deriv
+  // has published one, otherwise falls back to an estimate from the move
+  // between entry and current spot so the number is never just a dash.
+  const liveProfit = (t) => {
+    const stake = toNum(t.buy_price);
+    if (t.sell_price != null) return { value: Math.round((toNum(t.sell_price) - stake + Number.EPSILON) * 100) / 100, estimated: false };
+    if (t.entry_spot == null || t.current_spot == null || stake <= 0 || t.entry_spot === 0) return null;
+    const dir = /^(RISE|CALL|HIGHER|ASIAU|ONETOUCH|UP|DIGITMATCH|DIGITEVEN)/i.test(t.contract_type || '') ? 1 : -1;
+    const movePct = (toNum(t.current_spot) - toNum(t.entry_spot)) / toNum(t.entry_spot);
+    return { value: Math.round((dir * movePct * stake + Number.EPSILON) * 100) / 100, estimated: true };
+  };
 
   const activeSymbol = symbols.find((s) => s.symbol === symbol) || null;
   const decimals = activeSymbol?.decimals ?? 2;
@@ -2994,34 +3005,6 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
   }
 
   // --- sell an open contract early ---
-  async function handleSell() {
-    if (!contract || !contract.is_valid_to_sell || selling) return;
-    setSelling(true);
-    setActionError(null);
-    try {
-      const res = await fetch(`${API_BASE}/api/contract/sell`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ session: sessionId, account: selectedAccount, contract_id: contract.contract_id, price: contract.sell_price }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Sell failed');
-      const sold = data.sell;
-      const buyPrice = contractMeta?.price ?? 0;
-      const profit = (sold.sold_for ?? contract.sell_price) - buyPrice;
-      settleRef.current = contract.contract_id;
-      setResult({ won: profit >= 0, profit, soldEarly: true, soldFor: sold.sold_for });
-      setContract(null);
-      setContractMeta(null);
-      onTradeSettled && onTradeSettled({ id: contract.contract_id, symbol, direction: contractMeta?.contract_type, stake: buyPrice, profit, won: profit >= 0, ts: Date.now() });
-      refreshBalance();
-    } catch (e) {
-      setActionError(e.message);
-    } finally {
-      setSelling(false);
-    }
-  }
-
   const isTickContract = (contractMeta?.duration_unit ?? durationUnit) === 't';
   const contractEndMs = (() => {
     const expiry = contract?.date_expiry ?? contractMeta?.date_expiry;
@@ -3304,17 +3287,6 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
           <span className="mt-side-label">{upLabel}</span>
           <span className="mt-side-payout">{proposalLoading ? 'Pricing…' : (proposals.up ? `Payout ${proposals.up.payout.toLocaleString(undefined, { maximumFractionDigits: 2 })} ${currency}` : 'No price')}</span>
         </button>
-        {contractMeta && (
-          <div className="mt-open-inline">
-            <div className="mt-open-cell"><span>Entry</span><b>{contract?.entry_spot == null ? '—' : contract.entry_spot.toLocaleString(undefined, { maximumFractionDigits: decimals })}</b></div>
-            <div className="mt-open-cell"><span>Current</span><b>{contract?.current_spot == null ? '—' : contract.current_spot.toLocaleString(undefined, { maximumFractionDigits: decimals })}</b></div>
-            <div className="mt-open-cell"><span>Sell at</span><b>{contract?.sell_price == null ? '—' : contract.sell_price.toLocaleString(undefined, { maximumFractionDigits: decimals })}</b></div>
-            <button className="mt-sell-btn" onClick={handleSell} disabled={!authenticated || !contract?.is_valid_to_sell || selling}>
-              {selling ? 'Selling…' : 'Sell now'}
-            </button>
-            {!contract?.is_valid_to_sell && <span className="mt-hint">Not sellable yet</span>}
-          </div>
-        )}
       </div>
 
       {authenticated && (
@@ -3328,7 +3300,7 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
           {openTrades.length === 0 && <div className="mt-hint">No open trades — the ones you buy appear here with a live close price.</div>}
           <div className="mt-active-list">
             {openTrades.map((t) => {
-              const profit = t.sell_price != null ? t.sell_price - (t.buy_price || 0) : null;
+              const pl = liveProfit(t);
               const isChart = contractIdRef.current === t.contract_id;
               return (
                 <div className="mt-active-row" key={t.contract_id}>
@@ -3345,10 +3317,10 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
                     <span>current</span>
                   </span>
                   <span className="mt-active-cell">
-                    <b className={profit != null && profit >= 0 ? 'roi-up' : 'roi-down'}>
-                      {profit != null ? `${profit >= 0 ? '+' : ''}${profit.toLocaleString(undefined, { maximumFractionDigits: 2 })}` : '—'}
+                    <b className={pl == null ? '' : pl.value >= 0 ? 'roi-up' : 'roi-down'}>
+                      {pl == null ? '—' : `${pl.value >= 0 ? '+' : ''}${pl.value.toLocaleString(undefined, { maximumFractionDigits: 2 })}`}
                     </b>
-                    <span>P/L</span>
+                    <span>P/L{pl?.estimated ? ' (est)' : ''}</span>
                   </span>
                   <button className="btn-outline btn-small" onClick={() => handleSellOpen(t)} disabled={busy || t.sell_price == null}>
                     {t.sell_price == null ? 'Not sellable' : 'Close'}
@@ -4299,25 +4271,23 @@ function GlobalStyle() {
       .mt-bottom-actions { position: sticky; bottom: 0; z-index: 40; display: flex; gap: 10px; background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 10px; box-shadow: 0 -6px 24px rgba(0,0,0,0.12); }
       .mt-login-bar { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; background: rgba(76,110,245,0.1); border: 1px solid rgba(76,110,245,0.35); color: var(--text); border-radius: 10px; padding: 10px 12px; font-size: 13px; }
       .mt-login-bar span { display: inline-flex; align-items: center; gap: 6px; }
-      .mt-side-btn { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; border: none; border-radius: 12px; padding: 14px 10px; font-weight: 800; font-size: 15px; cursor: pointer; transition: transform 0.12s ease, filter 0.12s ease; }
+      .mt-side-btn { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 1px; border: none; border-radius: 10px; padding: 8px 8px; font-weight: 800; font-size: 14px; cursor: pointer; transition: transform 0.12s ease, filter 0.12s ease; }
       .mt-side-btn:hover:not(:disabled) { transform: translateY(-2px); filter: brightness(1.05); }
       .mt-side-btn:disabled { opacity: 0.55; cursor: not-allowed; }
       .mt-side-up { background: linear-gradient(180deg, #00e6b0, #00b894); color: #03241a; }
       .mt-side-down { background: linear-gradient(180deg, #ff5a63, #e8414c); color: #2b0507; }
-      .mt-side-label { font-size: 16px; line-height: 1.1; }
-      .mt-side-payout { font-size: 12px; opacity: 0.85; font-weight: 600; }
-      .mt-open-inline { flex: 1; display: flex; align-items: center; gap: 16px; flex-wrap: wrap; padding: 2px 6px; }
-      .mt-sell-btn { margin-left: auto; background: var(--accent-red); color: #fff; border: none; border-radius: 10px; padding: 12px 22px; font-weight: 800; font-size: 14px; cursor: pointer; }
-      .mt-sell-btn:hover:not(:disabled) { filter: brightness(1.1); }
-      .mt-sell-btn:disabled { opacity: 0.55; cursor: not-allowed; }
+      .mt-side-label { font-size: 14px; line-height: 1.1; }
+      .mt-side-payout { font-size: 11px; opacity: 0.85; font-weight: 600; }
       @media (max-width: 640px) {
         .mt-top-controls { margin-left: 0; width: 100%; }
         .mt-symbol-select { flex: 1 1 100%; }
         .mt-params { align-items: stretch; }
         .mt-param { flex: 1 1 45%; }
         .mt-menu-select, .mt-barrier-input { width: 100%; }
-        .mt-bottom-actions { flex-direction: column-reverse; }
-        .mt-side-btn { padding: 16px 10px; }
+        .mt-bottom-actions { flex-direction: row; gap: 8px; padding: 8px; border-radius: 12px; }
+        .mt-side-btn { padding: 8px 6px; border-radius: 9px; }
+        .mt-side-label { font-size: 13px; }
+        .mt-side-payout { font-size: 10px; }
       }
 
       .chart-toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }

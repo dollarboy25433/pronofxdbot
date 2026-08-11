@@ -1762,6 +1762,7 @@ function getTickStream(symbol) {
     mode: 'stream',        // 'stream' (ticks subscribe) or 'poll' (ticks_history)
     lastEpoch: 0,          // highest epoch already broadcast (dedup for poll overlap)
     emptyTicks: 0,         // consecutive placeholder ticks seen while streaming
+    gotRealTick: false,    // a real streaming tick has been received for this symbol
     pollTimer: null,
     pollInFlight: false,
     granularity: 60,       // candle bucket width in seconds (clients may change it)
@@ -1802,6 +1803,8 @@ function getTickStream(symbol) {
   const handleTick = (quote, epoch) => {
     if (epoch != null && epoch <= stream.lastEpoch) return;
     if (epoch != null) stream.lastEpoch = epoch;
+    stream.gotRealTick = true;
+    stream.emptyTicks = 0;
     broadcast({ msg_type: 'tick', tick: { quote, epoch, symbol } });
     if (stream.mode === 'stream') updateStreamCandle(quote, epoch);
   };
@@ -1844,7 +1847,9 @@ function getTickStream(symbol) {
 
   const startPollTimer = () => {
     if (stream.pollTimer) return;
-    stream.pollTimer = setInterval(pollTick, 1000);
+    // Poll fast enough that even the poll fallback only trails the live
+    // tick by ~half a second instead of a full tick.
+    stream.pollTimer = setInterval(pollTick, 500);
     pollTick();
   };
 
@@ -1879,11 +1884,13 @@ function getTickStream(symbol) {
           // real streaming tick
           handleTick(t.quote, t.epoch);
         } else if (stream.mode === 'stream') {
-          // Shared/throttled app ids reject `ticks subscribe` outright
-          // (e.g. InvalidSymbol) instead of the empty placeholder this
-          // used to check for. Either way, fall back to polling.
+          // Shared/throttled app ids push empty placeholder ticks. BUT the
+          // first message after `ticks subscribe` is also an empty
+          // placeholder — falling back to polling on that alone would make
+          // the chart a tick behind even when the real stream works. Only
+          // switch after several consecutive placeholders with no real tick.
           stream.emptyTicks += 1;
-          if (stream.emptyTicks >= 1) enterPollMode();
+          if (stream.emptyTicks >= 5 && !stream.gotRealTick) enterPollMode();
         }
         return;
       }

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Play, Square, Repeat, RotateCcw, Coffee, Filter, Download, Upload, Share2,
   Trash2, ArrowUp, ArrowDown, Copy, GripVertical, AlertTriangle, CheckCircle2,
@@ -49,6 +49,19 @@ const defaultBlocks = () => [
   { id: uid(), type: 'buy', settings: { ...BLOCK_DEFS.buy.default } },
   { id: uid(), type: 'trade_again', settings: { when: 'both' } },
 ];
+
+const STORAGE_KEY = 'pronofxdbot:strategy:v1';
+
+const loadSaved = () => {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed) && parsed.length) return normalizeBlocks(parsed);
+    }
+  } catch { /* ignore */ }
+  return defaultBlocks();
+};
 
 function normalizeBlocks(blocks) {
   const clean = (Array.isArray(blocks) ? blocks : [])
@@ -110,7 +123,7 @@ function importXml(text) {
 }
 
 export default function BotBuilderTab({ sessionId, accounts, selectedAccount, setSelectedAccount, currency, balance, onBalanceUpdate, onTradeSettled, onRequireAuth, initialXml, onActivity }) {
-  const [blocks, setBlocks] = useState(defaultBlocks);
+  const [blocks, setBlocks] = useState(loadSaved);
   const [selectedId, setSelectedId] = useState(null);
   const [dragIdx, setDragIdx] = useState(null);
 
@@ -127,6 +140,19 @@ export default function BotBuilderTab({ sessionId, accounts, selectedAccount, se
   const stopRef = useRef(false);
   const blocksRef = useRef(blocks);
   useEffect(() => { blocksRef.current = blocks; }, [blocks]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(blocks.map((b) => ({ type: b.type, settings: b.settings }))));
+    } catch { /* ignore */ }
+  }, [blocks]);
+
+  const resetBot = () => {
+    try { localStorage.removeItem(STORAGE_KEY); } catch { /* ignore */ }
+    setBlocks(defaultBlocks());
+    setSelectedId(null);
+    addLog('info', 'Strategy reset to the default template.');
+  };
   const loadedXmlRef = useRef(null);
   useEffect(() => {
     if (initialXml && initialXml !== loadedXmlRef.current) {
@@ -137,6 +163,26 @@ export default function BotBuilderTab({ sessionId, accounts, selectedAccount, se
   }, [initialXml]);
 
   const selected = blocks.find((b) => b.id === selectedId) || null;
+
+  // --- live strategy validation ---
+  const issues = useMemo(() => {
+    const out = [];
+    const buys = blocks.filter((b) => b.type === 'buy');
+    if (buys.length === 0) out.push('No Buy Contract block — add one to trade.');
+    if (buys.length > 1) out.push(`Trades ${buys.length} contracts in sequence each cycle.`);
+    const repeat = blocks.find((b) => b.type === 'repeat');
+    const tradeAgain = blocks.find((b) => b.type === 'trade_again');
+    if (repeat && tradeAgain) out.push('Repeat and Trade Again are both present — Repeat controls how many cycles run.');
+    if (!repeat && !tradeAgain) out.push('No Repeat or Trade Again block — the bot will run once.');
+    if (blocks.find((b) => b.type === 'stop')) out.push('Stop block halts the bot once reached.');
+    const conds = blocks.filter((b) => b.type === 'condition');
+    for (const c of conds) {
+      const ci = blocks.indexOf(c);
+      const nextBuy = blocks.slice(ci + 1).find((b) => b.type === 'buy');
+      if (!nextBuy) { out.push('A Purchase Condition has no Buy Contract after it — it will be ignored.'); break; }
+    }
+    return out;
+  }, [blocks]);
 
   // --- symbol catalog ---
   useEffect(() => {
@@ -310,7 +356,6 @@ export default function BotBuilderTab({ sessionId, accounts, selectedAccount, se
     });
     const buyRes = bought.buy;
     addLog('success', `Contract ${buyRes.contract_id} opened.`);
-    onBalanceUpdate ? null : null;
     refreshBalance();
     const seconds = (UNIT_SECONDS[duration_unit] || 60) * duration;
     const deadline = Date.now() + Math.min(Math.max(seconds * 2000, 20000), 300000);
@@ -336,6 +381,41 @@ export default function BotBuilderTab({ sessionId, accounts, selectedAccount, se
     } catch { /* keep last known */ }
   };
 
+  const lastDigit = (price) => {
+    const str = String(price);
+    for (let i = str.length - 1; i >= 0; i--) {
+      if (str[i] >= '0' && str[i] <= '9') return Number(str[i]);
+    }
+    return NaN;
+  };
+
+  // Purchase conditions gate the next Buy Contract in the flow. Instead of
+  // aborting the bot when the condition is false (as before), we wait and
+  // re-check — that is how a "purchase condition" is meant to behave.
+  const waitForCondition = async (cond, symbol) => {
+    const s = cond.settings;
+    if (s.type === 'always') return;
+    const value = Number(s.value);
+    let checks = 0;
+    while (!stopRef.current) {
+      let price = null;
+      try { price = await fetchSpot(symbol); } catch { price = null; }
+      if (price != null) {
+        let ok = false;
+        if (s.type === 'price_above') ok = price > value;
+        if (s.type === 'price_below') ok = price < value;
+        if (s.type === 'last_digit') ok = lastDigit(price) === value;
+        if (ok) return;
+        addLog('info', `Purchase condition not met (spot ${price}). Waiting…`);
+      } else {
+        addLog('warn', 'Could not read spot price — retrying.');
+      }
+      checks++;
+      if (checks >= 100) throw new Error('Purchase condition not met after 100 checks. Stopping.');
+      await sleep(3000);
+    }
+  };
+
   const runBot = async () => {
     if (runningRef.current) return;
     if (!sessionId || !selectedAccount) { if (onRequireAuth) onRequireAuth(); return; }
@@ -354,44 +434,52 @@ export default function BotBuilderTab({ sessionId, accounts, selectedAccount, se
       const repeat = strategy.find((b) => b.type === 'repeat');
       const tradeAgain = strategy.find((b) => b.type === 'trade_again');
       const stopBlock = strategy.find((b) => b.type === 'stop');
-      const breakBlock = strategy.find((b) => b.type === 'take_break');
-      const conditions = strategy.filter((b) => b.type === 'condition');
-      const maxPasses = repeat ? (Number(repeat.settings.times) || 1) : (tradeAgain ? Infinity : 1);
-      let pass = 0;
+      const maxCycles = repeat ? Math.max(1, Number(repeat.settings.times) || 1) : (tradeAgain ? Infinity : 1);
+      let cycle = 0;
 
-      while ((maxPasses === Infinity || pass < maxPasses) && !stopRef.current) {
-        pass++;
-        addLog('info', `— Cycle ${pass}${maxPasses === Infinity ? '' : ` / ${maxPasses}`} —`);
+      while ((maxCycles === Infinity || cycle < maxCycles) && !stopRef.current) {
+        cycle++;
+        addLog('info', `— Cycle ${cycle}${maxCycles === Infinity ? ' (continuous)' : ` / ${maxCycles}`} —`);
+        if (cycle === 1 && maxCycles === Infinity) addLog('info', 'Trade Again is on — the bot will run until you press Stop.');
 
-        for (const cond of conditions) {
-          const s = cond.settings;
-          if (s.type === 'always') continue;
-          const price = await fetchSpot(buys[0].settings.symbol);
-          if (price == null) throw new Error('Could not fetch spot price for the purchase condition.');
-          let ok = false;
-          if (s.type === 'price_above') ok = price > Number(s.value);
-          if (s.type === 'price_below') ok = price < Number(s.value);
-          if (s.type === 'last_digit') {
-            const digits = Number(price).toFixed(2).split('.')[1] || '';
-            ok = Number(digits.slice(-1)) === Number(s.value);
+        let lastTrade = null;
+        let pendingGates = [];
+
+        // Blocks run top to bottom in the order they appear on the canvas.
+        for (const b of strategy) {
+          if (stopRef.current) break;
+
+          if (b.type === 'buy') {
+            const gateSymbol = b.settings.symbol || buys[0].settings.symbol;
+            for (const g of pendingGates) await waitForCondition(g, gateSymbol);
+            pendingGates = [];
+            const res = await buyAndWait(b);
+            if (!res) break;
+            lastTrade = res;
+            setStats((st) => ({ ...st, runs: st.runs + 1, won: st.won + (res.won ? 1 : 0), lost: st.lost + (res.won ? 0 : 1), totalStake: st.totalStake + res.trade.stake, totalPayout: st.totalPayout + (res.won ? res.trade.stake + res.trade.profit : 0), profitLoss: st.profitLoss + res.trade.profit }));
+            if (onTradeSettled) onTradeSettled(res.trade);
+          } else if (b.type === 'condition') {
+            pendingGates.push(b);
+          } else if (b.type === 'take_break') {
+            const secs = Math.max(0, Number(b.settings.seconds) || 0);
+            if (secs > 0) {
+              addLog('info', `Taking a break — ${secs}s`);
+              await sleep(secs * 1000);
+            }
+          } else if (b.type === 'stop') {
+            break;
           }
-          if (!ok) { addLog('error', `Purchase condition not met (spot ${price}). Stopping.`); throw new Error('Condition not met'); }
         }
 
-        const res = await buyAndWait(buys[0]);
-        if (!res) break;
-        setStats((st) => ({ ...st, runs: st.runs + 1, won: st.won + (res.won ? 1 : 0), lost: st.lost + (res.won ? 0 : 1), totalStake: st.totalStake + res.trade.stake, totalPayout: st.totalPayout + (res.won ? res.trade.stake + res.trade.profit : 0), profitLoss: st.profitLoss + res.trade.profit }));
-        if (onTradeSettled) onTradeSettled(res.trade);
-
-        if (tradeAgain) {
-          if (tradeAgain.settings.when === 'win' && !res.won) { addLog('info', 'Trade Again set to win only — stopping after loss.'); break; }
-          if (tradeAgain.settings.when === 'loss' && res.won) { addLog('info', 'Trade Again set to loss only — stopping after win.'); break; }
+        if (stopRef.current) break;
+        if (tradeAgain && lastTrade) {
+          const when = tradeAgain.settings.when;
+          if ((when === 'win' && !lastTrade.won) || (when === 'loss' && lastTrade.won)) {
+            addLog('info', `Trade Again is set to "${when}" only — stopping after the ${lastTrade.won ? 'win' : 'loss'}.`);
+            break;
+          }
         }
-        if (breakBlock && !stopRef.current) {
-          addLog('info', `Taking a break — ${breakBlock.settings.seconds}s`);
-          await sleep(Number(breakBlock.settings.seconds) * 1000);
-        }
-        if (stopBlock) { addLog('info', 'Stop block reached.'); break; }
+        if (stopBlock) { addLog('info', 'Stop block reached — the bot will not trade again.'); break; }
       }
       if (stopRef.current) addLog('warn', 'Bot stopped by user.');
       else addLog('success', 'Bot finished.');
@@ -420,20 +508,29 @@ export default function BotBuilderTab({ sessionId, accounts, selectedAccount, se
       <div className="bb-head">
         <div>
           <h2 className="section-title">Bot Builder</h2>
-          <p className="section-sub">Build a strategy from blocks, import a Deriv DBot strategy, then run it live on your account.</p>
+          <p className="section-sub">Build a strategy from blocks. They run top to bottom each cycle — Buy Contract places a trade and waits for settlement, Purchase Condition gates the next buy, Trade Again restarts the cycle, Repeat limits how many cycles run.</p>
         </div>
         <div className="bb-actions">
           <button className="btn-ghost btn-small" onClick={() => fileRef.current && fileRef.current.click()}><Upload size={13} /> Import</button>
           <input ref={fileRef} type="file" accept=".json,.xml" style={{ display: 'none' }} onChange={handleImportFile} />
           <button className="btn-ghost btn-small" onClick={exportBot}><Download size={13} /> Export</button>
           <button className="btn-ghost btn-small" onClick={shareBot} disabled={!sessionId}><Share2 size={13} /> Share</button>
+          <button className="btn-ghost btn-small" onClick={resetBot}><RotateCcw size={13} /> Reset</button>
           {running ? (
             <button className="btn-primary btn-small bb-run-stop" onClick={stopBot}><Square size={13} /> Stop</button>
           ) : (
-            <button className="btn-primary btn-small bb-run" onClick={runBot}><Play size={13} /> Run</button>
+            <button className="btn-primary btn-small bb-run" onClick={runBot} disabled={!sessionId || !blocks.some((b) => b.type === 'buy')}><Play size={13} /> Run</button>
           )}
         </div>
       </div>
+
+      {issues.length > 0 && (
+        <div className="bb-issues">
+          {issues.map((t, i) => (
+            <span key={i} className="bb-issue"><AlertTriangle size={12} /> {t}</span>
+          ))}
+        </div>
+      )}
 
       {!sessionId && (
         <div className="bb-login-hint">
@@ -551,8 +648,11 @@ function summary(b) {
       const t = CONDITION_TYPES.find((c) => c.id === s.type);
       return t ? `${t.label}${s.type !== 'always' ? ' ' + s.value : ''}` : '';
     }
-    case 'trade_again': return `on ${s.when}`;
-    case 'repeat': return `${s.times} times`;
+    case 'trade_again': {
+      const w = { both: 'win or loss', win: 'win only', loss: 'loss only' }[s.when] || s.when;
+      return `restart on ${w}`;
+    }
+    case 'repeat': return `run ${s.times}×`;
     case 'take_break': return `${s.seconds}s`;
     default: return '';
   }
@@ -584,7 +684,7 @@ function BlockInspector({ block, symbols, symbolOpts, symbolsError, contractType
             ))}
           </select>
         </label>
-        <label className="bb-field"><span>Stake ({symbols.find((x) => x.symbol === s.symbol)?.market === 'cryptocurrency' ? 'USD' : 'USD'})</span>
+        <label className="bb-field"><span>Stake (USD)</span>
           <input className="bb-input" type="number" min="0.01" step="0.01" value={s.amount} onChange={(e) => set('amount', Number(e.target.value))} />
         </label>
         <div className="bb-row2">
@@ -675,6 +775,11 @@ const BB_CSS = `
 .bb-run-stop { background: var(--accent-red); }
 .bb-login-hint { display: flex; align-items: center; gap: 8px; background: rgba(255,178,36,0.1); color: #ffb224; border-radius: 10px; padding: 10px 12px; font-size: 12px; margin-bottom: 14px; flex-wrap: wrap; }
 .bb-login-hint .btn-primary { margin-left: auto; }
+
+.bb-issues { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+.bb-issue { display: inline-flex; align-items: center; gap: 6px; background: rgba(255,178,36,0.1); color: #ffb224; border: 1px solid rgba(255,178,36,0.35); border-radius: 8px; padding: 6px 10px; font-size: 12px; }
+.bb-issue svg { flex-shrink: 0; }
+.bb-run:disabled { opacity: 0.5; cursor: not-allowed; }
 
 .bb-grid { display: grid; grid-template-columns: 200px minmax(0, 1fr) 260px; gap: 14px; align-items: start; }
 
