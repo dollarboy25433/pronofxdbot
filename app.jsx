@@ -200,9 +200,9 @@ export default function App() {
       account: selectedAccount,
       symbol: t.symbol,
       contract_type: t.direction,
-      stake: t.stake,
-      profit: t.profit,
-      payout: t.payout || 0,
+      stake: Number(t.stake) || 0,
+      profit: Number(t.profit) || 0,
+      payout: Number(t.payout) || 0,
       status: t.won ? 'won' : 'lost',
       source: t.source || 'manual',
     };
@@ -1883,7 +1883,7 @@ function CopytradingTab({ sessionId, selectedAccount, accounts, currency, onRequ
         settings: {
           symbol: p.symbol,
           market: p.market || 'synthetic_index',
-          contract_type: p.contract_type || 'RISE',
+          contract_type: p.contract_type || 'CALL',
           amount: Number(p.amount) || 1,
           duration: Number(p.duration) || 5,
           duration_unit: p.duration_unit || 't',
@@ -2041,7 +2041,7 @@ function CopytradingTab({ sessionId, selectedAccount, accounts, currency, onRequ
     return list;
   }, [strategies, search, sortBy]);
 
-  const COPY_TYPES = ['CALL', 'PUT', 'RISE', 'FALL', 'ASIAU', 'ASIAD', 'DIGITMATCH', 'DIGITDIFF'];
+  const COPY_TYPES = ['CALL', 'PUT', 'ASIAU', 'ASIAD', 'DIGITMATCH', 'DIGITDIFF'];
   const maskToken = (t) => (t ? `${String(t).slice(0, 4)}…${String(t).slice(-4)}` : '—');
 
   const pickStat = (...paths) => {
@@ -2425,7 +2425,7 @@ const MT_DIGIT_CATEGORIES = new Set(['digits', 'matchdiff']);
 const MT_TYPE_NAMES = {
   RISE: 'Rise', FALL: 'Fall',
   CALLE: 'Rise (Allow Equals)', PUTE: 'Fall (Allow Equals)',
-  CALL: 'Higher', PUT: 'Lower',
+  CALL: 'Rise', PUT: 'Fall',
   HIGHER: 'High', LOWER: 'Low',
   ASIANU: 'Asia Up', ASIAND: 'Asia Down',
   DIGITMATCH: 'Matches', DIGITDIFF: 'Differs',
@@ -2460,7 +2460,7 @@ function formatRemaining(ms) {
 // selector used in trading apps (Deriv DTrader / Pocket Option style).
 // Each entry maps to the buy (up/green) and sell (down/red) contract types.
 const MT_MENU = [
-  { id: 'risefall', label: 'Rise / Fall', up: 'RISE', down: 'FALL' },
+  { id: 'risefall', label: 'Rise / Fall', up: 'CALL', down: 'PUT' },
   { id: 'callput', label: 'Call / Put', up: 'CALL', down: 'PUT' },
   { id: 'highlow', label: 'Higher / Lower', up: 'HIGHER', down: 'LOWER' },
   { id: 'matchdiff', label: 'Matches / Differs', up: 'DIGITMATCH', down: 'DIGITDIFF' },
@@ -2476,7 +2476,7 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
   const [contractCategories, setContractCategories] = useState([]);
   const [menu, setMenu] = useState('risefall');
 
-  const [chartType, setChartType] = useState('candlestick');
+  const [chartType, setChartType] = useState('area');
   const [duration, setDuration] = useState(5);
   const [durationUnit, setDurationUnit] = useState('t');
   const [stake, setStake] = useState(10);
@@ -2517,7 +2517,7 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
   const toNum = (v) => { const n = Number(v); return Number.isFinite(n) ? n : 0; };
   const normOpen = (c) => ({
     contract_id: c.contract_id,
-    symbol: c.symbol,
+    symbol: c.underlying_symbol || c.symbol,
     contract_type: c.contract_type,
     buy_price: toNum(c.buy_price),
     payout: toNum(c.payout),
@@ -2674,7 +2674,7 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
       if (settleRef.current === poc.contract_id) return;
       settleRef.current = poc.contract_id;
       const meta = contractMetaRef.current || {};
-      const profit = poc.profit ?? 0;
+      const profit = Number(poc.profit ?? 0) || 0;
       const wasChart = contractIdRef.current === poc.contract_id;
       if (wasChart) {
         setResult({ won: profit >= 0, profit, soldEarly: false });
@@ -2684,7 +2684,7 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
       setOpenTrades((prev) => prev.filter((t) => t.contract_id !== poc.contract_id));
       onTradeSettled && onTradeSettled({
         id: poc.contract_id,
-        symbol: poc.symbol || symbol,
+        symbol: poc.underlying_symbol || poc.symbol || symbol,
         direction: (wasChart && meta.contract_type) || poc.contract_type || 'UNKNOWN',
         stake: (wasChart && meta.price) || poc.buy_price || 0,
         profit,
@@ -2701,7 +2701,7 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
       const upd = {
         ...(idx >= 0 ? prev[idx] : {}),
         contract_id: poc.contract_id,
-        symbol: poc.symbol || symbol,
+        symbol: poc.underlying_symbol || poc.symbol || symbol,
         contract_type: poc.contract_type || prev[idx]?.contract_type || null,
         current_spot: poc.current_spot ?? null,
         sell_price: poc.sell_price ?? null,
@@ -2727,7 +2727,7 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
   // active-trades container) and merge with anything we already track.
   const loadPortfolio = () => {
     if (!sessionId || !selectedAccount) { setOpenTrades([]); return; }
-    fetch(`${API_BASE}/api/portfolio?session=${encodeURIComponent(sessionId)}&account=${encodeURIComponent(selectedAccount)}`)
+    fetch(`${API_BASE}/api/contract/open?session=${encodeURIComponent(sessionId)}&account=${encodeURIComponent(selectedAccount)}`)
       .then((r) => (r.ok ? r.json() : Promise.reject()))
       .then((data) => {
         const open = (data.contracts || [])
@@ -2833,10 +2833,9 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
     const p = { contract_type: side === 'up' ? currentMenu.up : currentMenu.down };
     if (menu === 'matchdiff') p.barrier = String(digit);
     if (menu === 'highlow') {
-      let b = String(barrier || '+5.0').trim();
-      if (!/^[+-]/.test(b)) b = `+${b}`;
-      if (side === 'down') b = b[0] === '-' ? b.slice(1) : `-${b}`;
-      p.barrier = b;
+      let b = String(barrier || '5.0').trim().replace(/^[+-]/, '');
+      if (!/^[0-9]/.test(b)) b = '5.0';
+      p.barrier = `${side === 'up' ? '+' : '-'}${b}`;
     }
     if (menu === 'accumulators') p.prediction = side === 'up' ? '1' : '-1';
     return p;
@@ -3364,7 +3363,7 @@ function ManualTraderTab({ sessionId, accounts, selectedAccount, setSelectedAcco
       {result && (
         <div className={`mt-result ${result.won ? 'mt-result-won' : 'mt-result-lost'}`}>
           <b>{result.soldEarly ? (result.won ? 'Closed at a profit' : 'Closed at a loss') : (result.won ? 'Contract won' : 'Contract lost')}</b>
-          <span>{result.profit >= 0 ? '+' : ''}{result.profit.toFixed(2)} {currency}</span>
+          <span>{Number(result.profit) >= 0 ? '+' : ''}{Number(result.profit).toFixed(2)} {currency}</span>
         </div>
       )}
 
