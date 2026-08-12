@@ -157,6 +157,14 @@ export default function App() {
   }
 
   function handleLogout() {
+    if (sessionId) {
+      // Invalidate the server-side session (and the Deriv token it holds).
+      fetch(`${API_BASE}/api/logout`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session: sessionId }),
+      }).catch(() => {});
+    }
     localStorage.removeItem(SESSION_KEY);
     setSessionId(null);
     setAccounts([]);
@@ -861,7 +869,7 @@ function DashboardTab({ loggedIn, sessionId, accounts, selectedAccount, setSelec
                   ))}
                 </div>
 
-                <div className="table-card">
+                <div className="table-card dash-recent">
                   <div className="table-row table-head">
                     <span>Recent trades</span><span>Type</span><span>Stake</span><span>Result</span>
                   </div>
@@ -4096,6 +4104,8 @@ function GlobalStyle() {
       .table-row:last-child { border-bottom: none; }
       .table-head { color: var(--text-muted); font-size: 11px; text-transform: uppercase; font-weight: 700; }
       .table-row-5 { grid-template-columns: 1.6fr 1fr 1fr 1fr 1.2fr; }
+      .dash-recent { max-height: 340px; overflow-y: auto; }
+      .dash-recent .table-head { position: sticky; top: 0; background: var(--panel); z-index: 1; }
       .dash-trades { display: flex; flex-direction: column; gap: 12px; margin-top: 18px; }
       .dash-trades-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
       .dash-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; }
@@ -4387,7 +4397,8 @@ function GlobalStyle() {
         .table-card { overflow-x: auto; }
         .table-row { grid-template-columns: minmax(160px, 2fr) 1fr 1fr 0.8fr; min-width: 480px; }
         .table-row-5 { grid-template-columns: minmax(130px, 1.6fr) 1fr 1fr 1fr 1.2fr; }
-        .mt-active-row { grid-template-columns: minmax(110px, 1.6fr) 1fr 1fr 1fr auto; min-width: 560px; }
+        .mt-active-row { grid-template-columns: minmax(0, 1.5fr) minmax(0, 0.8fr) minmax(0, 1fr) minmax(0, 1fr) auto; min-width: 0; gap: 8px; }
+        .mt-active-list { overflow-x: auto; }
       }
 
       @media (max-width: 760px) {
@@ -4408,6 +4419,12 @@ function GlobalStyle() {
         .section-title { font-size: 18px; }
         .tabs { padding: 4px 10px 8px; min-height: clamp(42px, 6vh, 54px); }
         .tab { padding: 7px 10px; font-size: 12px; }
+        .dash-stats { grid-template-columns: repeat(2, 1fr); gap: 8px; }
+        .stat-card { padding: 10px 12px; }
+        .stat-card b { font-size: 16px; }
+        .stat-label { font-size: 10px; }
+        .stat-sub { font-size: 10px; }
+        .dash-recent { max-height: 300px; }
         .promo-card { flex-basis: 260px; }
         .promo-img { height: 130px; }
         .promo-row { display: grid; grid-template-columns: 1fr; overflow: visible; gap: 14px; }

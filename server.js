@@ -26,7 +26,20 @@ import path from 'path';
 import pg from 'pg';
 
 const app = express();
-app.use(cors({ origin: process.env.FRONTEND_URL || 'http://localhost:5173', credentials: true }));
+// Both the main frontend (FRONTEND_URL) and the separately hosted admin
+// console (ADMIN_URL) share this backend. Requests without an Origin header
+// (same-origin page loads, curl) are always allowed.
+const ALLOWED_ORIGINS = [
+  process.env.FRONTEND_URL || 'http://localhost:5173',
+  process.env.ADMIN_URL || 'http://localhost:5174',
+].filter(Boolean);
+app.use(cors({
+  origin(origin, cb) {
+    if (!origin || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+    cb(null, false);
+  },
+  credentials: true,
+}));
 // 12mb so base64 banner images can reach /api/upload before being handed
 // off to Cloudinary (the DB only ever stores the resulting small URLs).
 app.use(express.json({ limit: '12mb' }));
@@ -34,6 +47,19 @@ app.use(express.json({ limit: '12mb' }));
 const PORT = process.env.PORT || 4000;
 const DERIV_APP_ID = process.env.DERIV_APP_ID || '126958'; // used for REST API calls (Deriv-App-ID header)
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
+const ADMIN_URL = process.env.ADMIN_URL || 'http://localhost:5174';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin123';
+// Signing secret for the admin bearer token. Persist it in .env so admin
+// tokens keep working across server restarts.
+const ADMIN_SECRET = process.env.ADMIN_SECRET || crypto.randomBytes(32).toString('hex');
+const ADMIN_TOKEN_TTL_MS = 1000 * 60 * 60 * 24 * 7;
+
+if (!process.env.ADMIN_PASSWORD) {
+  console.warn('[admin] ADMIN_PASSWORD is not set — using default "admin123". Add it to .env.');
+}
+if (!process.env.ADMIN_SECRET) {
+  console.warn('[admin] ADMIN_SECRET is not set — admin sessions will not survive a restart. Add it to .env.');
+}
 
 // DERIV_APP_ID must be the *numeric* app id from Deriv's classic app
 // registration (api.deriv.com -> Manage Apps), used as the `app_id` query
@@ -159,6 +185,12 @@ CREATE TABLE IF NOT EXISTS trade_history (
   trade_time TIMESTAMPTZ DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_trade_history_loginid ON trade_history(loginid, trade_time DESC);
+CREATE TABLE IF NOT EXISTS sessions (
+  session_id TEXT PRIMARY KEY,
+  data JSONB NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT now(),
+  last_used_at TIMESTAMPTZ DEFAULT now()
+);
 `;
 
 async function initDb() {
@@ -174,7 +206,8 @@ async function initDb() {
     console.error('[db] init failed:', e.message);
   }
 }
-initDb();
+// Top-level await: the schema must be ready before anything else runs.
+await initDb().catch(() => {});
 
 // --- OAuth 2.0 + PKCE configuration (current Deriv flow) ---
 // client_id is the OAuth2 client id from developers.deriv.com (an app id is a
@@ -199,15 +232,81 @@ const DIST_DIR = path.join(process.cwd(), 'dist');
 // Serve built frontend in production
 app.use(express.static(DIST_DIR));
 
-// --- In-memory session store (swap for Redis/DB in production) ---
+// --- Session store (persisted to PostgreSQL) ---
+// Sessions live in an in-memory Map as the hot cache AND are written through
+// to the `sessions` table so a server restart (or a browser refresh) does not
+// log users out. On boot the cache is rehydrated from the DB; every create /
+// update / delete touches both. When no DATABASE_URL is configured the app
+// degrades to the previous memory-only behaviour.
 // session: { oauth: 'v2', token, accounts: [{account, token, currency}], createdAt }
 const sessions = new Map();
+const SESSION_MAX_AGE_MS = 1000 * 60 * 60 * 24 * 30; // persistent until logout (30d safety cap)
+
+async function persistSession(sessionId, data) {
+  if (!db) return;
+  try {
+    await db.query(
+      `INSERT INTO sessions (session_id, data, created_at, last_used_at)
+       VALUES ($1, $2, $3, now())
+       ON CONFLICT (session_id) DO UPDATE SET data = EXCLUDED.data, last_used_at = now()`,
+      [sessionId, JSON.stringify(data), new Date(data.createdAt || Date.now())]
+    );
+  } catch (e) {
+    console.error('[db] session persist failed:', e.message);
+  }
+}
+
+async function deleteSession(sessionId) {
+  sessions.delete(sessionId);
+  if (!db) return;
+  try {
+    await db.query('DELETE FROM sessions WHERE session_id = $1', [sessionId]);
+  } catch (e) {
+    console.error('[db] session delete failed:', e.message);
+  }
+}
 
 function createSession(data) {
   const sessionId = crypto.randomBytes(24).toString('hex');
-  sessions.set(sessionId, { ...data, createdAt: Date.now() });
+  const record = { ...data, createdAt: Date.now() };
+  sessions.set(sessionId, record);
+  persistSession(sessionId, record);
   return sessionId;
 }
+
+// Rehydrate the session cache from Postgres so sessions survive restarts.
+async function loadSessionsFromDb() {
+  if (!db) return;
+  try {
+    const { rows } = await db.query('SELECT session_id, data, created_at FROM sessions');
+    let loaded = 0;
+    for (const row of rows) {
+      let data = row.data;
+      if (typeof data === 'string') { try { data = JSON.parse(data); } catch { continue; } }
+      const createdAt = Date.parse(row.created_at) || Date.now();
+      if (Number.isFinite(createdAt) && Date.now() - createdAt > SESSION_MAX_AGE_MS) {
+        await db.query('DELETE FROM sessions WHERE session_id = $1', [row.session_id]).catch(() => {});
+        continue;
+      }
+      sessions.set(row.session_id, { ...data, createdAt });
+      loaded += 1;
+    }
+    console.log(`[db] rehydrated ${loaded} sessions from database`);
+  } catch (e) {
+    console.error('[db] session rehydrate failed:', e.message);
+  }
+}
+
+// Sweep expired sessions out of both the cache and the DB.
+setInterval(() => {
+  const now = Date.now();
+  for (const [sid, data] of sessions) {
+    if (data.createdAt && now - data.createdAt > SESSION_MAX_AGE_MS) {
+      sessions.delete(sid);
+      if (db) db.query('DELETE FROM sessions WHERE session_id = $1', [sid]).catch(() => {});
+    }
+  }
+}, 60 * 60 * 1000);
 
 // --- PKCE helpers (RFC 7636) ---
 const pendingAuth = new Map(); // state -> { verifier, expiresAt }
@@ -395,7 +494,10 @@ app.get('/api/accounts', async (req, res) => {
 
   if (data.oauth === 'v2' && accounts.length === 0) {
     accounts = await accountsFromToken(data.token);
-    if (accounts.length > 0) data.accounts = accounts;
+    if (accounts.length > 0) {
+      data.accounts = accounts;
+      persistSession(session, data);
+    }
   }
 
   // Log the first account resolution as a 'login' activity, once per session.
@@ -406,6 +508,15 @@ app.get('/api/accounts', async (req, res) => {
 
   // Only expose account id + currency, never the token, to the browser
   res.json({ accounts: accounts.map(({ account, currency }) => ({ account, currency })) });
+});
+
+// Invalidate a session on logout. The frontend also clears its local storage;
+// this guarantees the server-side session (and the Deriv token it holds) is
+// gone too, so the same session id cannot be replayed after logout.
+app.post('/api/logout', async (req, res) => {
+  const sid = (req.body && req.body.session) || req.query.session;
+  if (sid) await deleteSession(sid);
+  res.json({ ok: true });
 });
 
 // --- Step 4: fetch balance for a specific account via Deriv WebSocket API ---
@@ -2190,6 +2301,269 @@ function releaseBalanceStream(token, account, client) {
   }
 }
 
+// ---------------------------------------------------------------
+// Admin console (separately hosted frontend in /admin)
+// Shares this backend. The admin signs in with ADMIN_PASSWORD and receives
+// an HMAC-signed bearer token (signed with ADMIN_SECRET); every /api/admin/*
+// route verifies it with requireAdmin. All routes are read-only except the
+// explicit deletes, and none of them touch Deriv.
+// ---------------------------------------------------------------
+
+function signAdminToken() {
+  const payload = {
+    role: 'admin',
+    iat: Math.floor(Date.now() / 1000),
+    exp: Math.floor(Date.now() / 1000) + Math.floor(ADMIN_TOKEN_TTL_MS / 1000),
+  };
+  const body = Buffer.from(JSON.stringify(payload)).toString('base64url');
+  const sig = crypto.createHmac('sha256', ADMIN_SECRET).update(body).digest('base64url');
+  return `${body}.${sig}`;
+}
+
+function verifyAdminToken(token) {
+  if (!token || typeof token !== 'string') return false;
+  const parts = token.split('.');
+  if (parts.length !== 2) return false;
+  const expected = crypto.createHmac('sha256', ADMIN_SECRET).update(parts[0]).digest('base64url');
+  if (parts[1] !== expected) return false;
+  try {
+    const payload = JSON.parse(Buffer.from(parts[0], 'base64url').toString('utf8'));
+    if (payload.role !== 'admin' || payload.exp * 1000 < Date.now()) return false;
+    return true;
+  } catch { /* malformed */ }
+  return false;
+}
+
+function requireAdmin(req, res, next) {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : String(req.query.token || '');
+  if (!verifyAdminToken(token)) return res.status(401).json({ error: 'Admin authentication required' });
+  next();
+}
+
+async function requireDb(res) {
+  if (!db) {
+    res.status(503).json({ error: 'Database not configured' });
+    return false;
+  }
+  return true;
+}
+
+app.post('/api/admin/login', (req, res) => {
+  const { password } = req.body || {};
+  if (!ADMIN_PASSWORD || password !== ADMIN_PASSWORD) {
+    return res.status(401).json({ error: 'Invalid admin password' });
+  }
+  res.json({ token: signAdminToken(), expiresInMs: ADMIN_TOKEN_TTL_MS });
+});
+
+app.get('/api/admin/me', requireAdmin, (req, res) => {
+  res.json({ ok: true, role: 'admin' });
+});
+
+app.get('/api/admin/stats', requireAdmin, async (req, res) => {
+  if (!(await requireDb(res))) return;
+  try {
+    const [users, activities, circles, bots, strategies, trades, active7, trades7] = await Promise.all([
+      db.query('SELECT COUNT(*)::int AS n FROM users'),
+      db.query('SELECT COUNT(*)::int AS n FROM activities'),
+      db.query('SELECT COUNT(*)::int AS n FROM circles'),
+      db.query('SELECT COUNT(*)::int AS n FROM bots'),
+      db.query('SELECT COUNT(*)::int AS n FROM copy_strategies'),
+      db.query('SELECT COUNT(*)::int AS n FROM trade_history'),
+      db.query("SELECT COUNT(DISTINCT loginid)::int AS n FROM users WHERE last_seen_at >= now() - interval '7 days'"),
+      db.query("SELECT COUNT(*)::int AS n, COALESCE(SUM(profit), 0) AS net FROM trade_history WHERE trade_time >= now() - interval '7 days'"),
+    ]);
+    res.json({
+      users: users.rows[0].n,
+      activities: activities.rows[0].n,
+      circles: circles.rows[0].n,
+      bots: bots.rows[0].n,
+      strategies: strategies.rows[0].n,
+      trades: trades.rows[0].n,
+      activeLast7d: active7.rows[0].n,
+      tradesLast7d: trades7.rows[0].n,
+      netLast7d: Number(trades7.rows[0].net),
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/admin/users', requireAdmin, async (req, res) => {
+  if (!(await requireDb(res))) return;
+  const search = String(req.query.search || '').replace(/[%_]/g, '');
+  const limit = Math.min(parseInt(req.query.limit || '100', 10) || 100, 500);
+  const offset = Math.max(parseInt(req.query.offset || '0', 10) || 0, 0);
+  try {
+    const { rows } = await db.query(
+      `SELECT u.loginid, u.currency, u.created_at, u.last_seen_at,
+              (SELECT COUNT(*) FROM activities a WHERE a.loginid = u.loginid)::int AS activity_count,
+              (SELECT COUNT(*) FROM trade_history t WHERE t.loginid = u.loginid)::int AS trade_count
+         FROM users u
+        WHERE ($1 = '' OR u.loginid ILIKE '%' || $1 || '%')
+        ORDER BY u.last_seen_at DESC
+        LIMIT $2 OFFSET $3`,
+      [search, limit, offset]
+    );
+    res.json({ users: rows });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete('/api/admin/users/:loginid', requireAdmin, async (req, res) => {
+  if (!(await requireDb(res))) return;
+  const loginid = String(req.params.loginid || '').slice(0, 64);
+  if (!loginid) return res.status(400).json({ error: 'Missing loginid' });
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('DELETE FROM circle_members WHERE loginid = $1', [loginid]);
+    await client.query('DELETE FROM copy_follows WHERE loginid = $1', [loginid]);
+    await client.query('DELETE FROM circles WHERE owner_loginid = $1', [loginid]);
+    await client.query('DELETE FROM bots WHERE owner_loginid = $1', [loginid]);
+    await client.query('DELETE FROM copy_strategies WHERE owner_loginid = $1', [loginid]);
+    await client.query('DELETE FROM trade_history WHERE loginid = $1', [loginid]);
+    await client.query('DELETE FROM activities WHERE loginid = $1', [loginid]);
+    await client.query('DELETE FROM users WHERE loginid = $1', [loginid]);
+    await client.query('COMMIT');
+    res.json({ ok: true });
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    res.status(500).json({ error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.get('/api/admin/activities', requireAdmin, async (req, res) => {
+  if (!(await requireDb(res))) return;
+  const limit = Math.min(parseInt(req.query.limit || '100', 10) || 100, 500);
+  try {
+    const { rows } = await db.query(
+      'SELECT id, loginid, type, detail, created_at FROM activities ORDER BY created_at DESC LIMIT $1',
+      [limit]
+    );
+    res.json({ activities: rows });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/admin/circles', requireAdmin, async (req, res) => {
+  if (!(await requireDb(res))) return;
+  try {
+    const { rows } = await db.query(
+      `SELECT c.id, c.name, c.description, c.banner, c.owner_loginid, c.created_at,
+              COUNT(m.loginid)::int AS members
+         FROM circles c
+         LEFT JOIN circle_members m ON m.circle_id = c.id
+        GROUP BY c.id
+        ORDER BY c.created_at DESC
+        LIMIT 500`
+    );
+    res.json({ circles: rows });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete('/api/admin/circles/:id', requireAdmin, async (req, res) => {
+  if (!(await requireDb(res))) return;
+  try {
+    await db.query('DELETE FROM circles WHERE id = $1', [Number(req.params.id)]);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/admin/bots', requireAdmin, async (req, res) => {
+  if (!(await requireDb(res))) return;
+  try {
+    const { rows } = await db.query(
+      `SELECT id, name, description, kind, owner_loginid, uses, created_at
+         FROM bots ORDER BY created_at DESC LIMIT 500`
+    );
+    res.json({ bots: rows });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/admin/bots/:id/xml', requireAdmin, async (req, res) => {
+  if (!(await requireDb(res))) return;
+  try {
+    const { rows } = await db.query('SELECT xml FROM bots WHERE id = $1', [Number(req.params.id)]);
+    if (!rows.length) return res.status(404).json({ error: 'Bot not found' });
+    res.json({ xml: rows[0].xml });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete('/api/admin/bots/:id', requireAdmin, async (req, res) => {
+  if (!(await requireDb(res))) return;
+  try {
+    await db.query('DELETE FROM bots WHERE id = $1', [Number(req.params.id)]);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/admin/copy/strategies', requireAdmin, async (req, res) => {
+  if (!(await requireDb(res))) return;
+  try {
+    const { rows } = await db.query(
+      `SELECT id, name, description, owner_loginid, followers, status, created_at
+         FROM copy_strategies ORDER BY created_at DESC LIMIT 500`
+    );
+    res.json({ strategies: rows });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete('/api/admin/copy/strategies/:id', requireAdmin, async (req, res) => {
+  if (!(await requireDb(res))) return;
+  try {
+    await db.query('DELETE FROM copy_strategies WHERE id = $1', [Number(req.params.id)]);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/admin/trades', requireAdmin, async (req, res) => {
+  if (!(await requireDb(res))) return;
+  const days = Math.min(parseInt(req.query.days || '30', 10) || 30, 365);
+  try {
+    const summary = await db.query(
+      `SELECT to_char(trade_time::date, 'YYYY-MM-DD') AS day,
+              COUNT(*)::int AS total,
+              COUNT(*) FILTER (WHERE profit >= 0)::int AS wins,
+              COUNT(*) FILTER (WHERE profit < 0)::int AS losses,
+              COALESCE(SUM(profit), 0) AS net
+         FROM trade_history
+        WHERE trade_time >= now() - make_interval(days => $1)
+        GROUP BY trade_time::date ORDER BY trade_time::date DESC`,
+      [days]
+    );
+    const recent = await db.query(
+      `SELECT id, loginid, symbol, contract_type, stake, profit, payout, status, source, trade_time
+         FROM trade_history ORDER BY trade_time DESC LIMIT 200`
+    );
+    res.json({
+      days: summary.rows.map((r) => ({ day: r.day, total: r.total, wins: r.wins, losses: r.losses, net: Number(r.net) })),
+      recent: recent.rows,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // SPA fallback: serve index.html for any non-API route
 app.use((req, res) => {
   if (req.path.startsWith('/auth') || req.path.startsWith('/api')) {
@@ -2197,6 +2571,12 @@ app.use((req, res) => {
   }
   res.sendFile(path.join(DIST_DIR, 'index.html'));
 });
+
+// Top-level await: persisted sessions must be rehydrated into the cache
+// before the server starts listening, so a request arriving right after boot
+// never misses a session (which previously caused refresh-logouts on the
+// first request after a restart).
+await loadSessionsFromDb();
 
 const httpServer = app.listen(PORT, () => {
   console.log(`Deriv backend running on http://localhost:${PORT}`);

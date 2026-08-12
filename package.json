@@ -8,7 +8,9 @@
     "server": "nodemon server.js",
     "dev:all": "concurrently \"npm run server\" \"npm run dev\"",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "dev:admin": "npm --prefix admin run dev",
+    "build:admin": "npm --prefix admin run build"
   },
   "dependencies": {
     "@vitejs/plugin-react": "^4.3.1",

@@ -3,3 +3,7 @@ node_modules
 
 # Stakpak session files
 .stakpak/session*
+
+# Admin console (separately hosted) build output + deps
+admin/node_modules
+admin/dist

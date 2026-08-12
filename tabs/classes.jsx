@@ -487,6 +487,10 @@ function CourseDetail({ course, progress, setProgress, onBack }) {
 
   const [view, setView] = useState({ type: 'overview' });
 
+  useEffect(() => {
+    try { window.scrollTo(0, 0); } catch { /* ignore */ }
+  }, [view]);
+
   function markLesson(lessonId) {
     setProgress((p) => {
       const cur = p[course.id] || { done: {}, enrolled: true };
@@ -512,6 +516,7 @@ function CourseDetail({ course, progress, setProgress, onBack }) {
         onComplete={() => markLesson(view.lessonId)}
         onNavigate={(id) => setView({ type: 'lesson', lessonId: id })}
         onBack={() => setView({ type: 'overview' })}
+        onQuiz={() => setView({ type: 'quiz' })}
         hasQuiz={!!course.quiz?.length}
       />
     );
@@ -597,7 +602,7 @@ function COURSE_LESSON(course, lessonId) {
   return null;
 }
 
-function LessonView({ course, lesson, isDone, onComplete, onBack, hasQuiz }) {
+function LessonView({ course, lesson, isDone, onComplete, onBack, onQuiz, hasQuiz }) {
   const [nextId, prevId] = useMemo(() => {
     const ids = course.modules.flatMap((m) => m.lessons.map((l) => l.id));
     const i = ids.indexOf(lesson.id);
@@ -629,7 +634,7 @@ function LessonView({ course, lesson, isDone, onComplete, onBack, hasQuiz }) {
       <div className="cls-lesson-nav">
         {prevId && <button className="btn-outline" onClick={() => onNavigate(prevId)}><ChevronLeft size={14} /> Previous</button>}
         {isDone ? (
-          <button className="btn-primary" onClick={() => { if (nextId) onNavigate(nextId); else onBack(); }}>{nextId ? 'Next lesson' : hasQuiz ? 'Take the quiz' : 'Finish'}</button>
+          <button className="btn-primary" onClick={() => { if (nextId) onNavigate(nextId); else if (hasQuiz) onQuiz(); else onBack(); }}>{nextId ? 'Next lesson' : hasQuiz ? 'Take the quiz' : 'Finish'}</button>
         ) : (
           <button className="btn-primary" onClick={onComplete}>{nextId ? 'Mark complete' : 'Complete'}</button>
         )}
