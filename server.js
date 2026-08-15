@@ -54,6 +54,63 @@ const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin123';
 const ADMIN_SECRET = process.env.ADMIN_SECRET || crypto.randomBytes(32).toString('hex');
 const ADMIN_TOKEN_TTL_MS = 1000 * 60 * 60 * 24 * 7;
 
+// Paystack (KES payments for paid live sessions). Set PAYSTACK_SECRET_KEY in
+// .env to enable paid bookings; paid sessions are rejected with a clear 503
+// until it is configured. Amounts are stored/displayed in whole KES and sent
+// to Paystack in cents (amount * 100).
+const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY || '';
+const PAYSTACK_BASE = 'https://api.paystack.co';
+
+async function paystackInitialize({ email, amountKes, reference, callbackUrl }) {
+  const res = await fetch(`${PAYSTACK_BASE}/transaction/initialize`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      email,
+      amount: Math.round(Number(amountKes) * 100),
+      currency: 'KES',
+      reference,
+      callback_url: callbackUrl,
+    }),
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok || !body.status) {
+    throw new Error(body?.message || body?.meta?.next_step?.value || `Paystack initialize HTTP ${res.status}`);
+  }
+  return body.data; // { authorization_url, reference, access_code }
+}
+
+async function paystackVerify(reference) {
+  const res = await fetch(`${PAYSTACK_BASE}/transaction/verify/${encodeURIComponent(reference)}`, {
+    headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY}` },
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(`Paystack verify HTTP ${res.status}`);
+  return body;
+}
+
+// ICE servers handed to browsers for the screen-share (WebRTC) broadcasts.
+// STUN is enough when host and viewers are on the same network; for public
+// broadcasting set RTC_TURN_URL (+ username/credential) in .env so media
+// still flows when the host is behind a restrictive NAT.
+const RTC_ICE_SERVERS = [];
+if (process.env.RTC_STUN !== 'off') {
+  RTC_ICE_SERVERS.push(
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:global.stun.twilio.com:3478' }
+  );
+}
+if (process.env.RTC_TURN_URL) {
+  RTC_ICE_SERVERS.push({
+    urls: process.env.RTC_TURN_URL,
+    username: process.env.RTC_TURN_USERNAME || '',
+    credential: process.env.RTC_TURN_CREDENTIAL || '',
+  });
+}
+
 if (!process.env.ADMIN_PASSWORD) {
   console.warn('[admin] ADMIN_PASSWORD is not set — using default "admin123". Add it to .env.');
 }
@@ -191,6 +248,46 @@ CREATE TABLE IF NOT EXISTS sessions (
   created_at TIMESTAMPTZ DEFAULT now(),
   last_used_at TIMESTAMPTZ DEFAULT now()
 );
+CREATE TABLE IF NOT EXISTS promotions (
+  id BIGSERIAL PRIMARY KEY,
+  tag TEXT DEFAULT 'OFFER',
+  tag_color TEXT DEFAULT '',
+  title TEXT NOT NULL,
+  copy TEXT DEFAULT '',
+  image TEXT DEFAULT '',
+  link TEXT DEFAULT '',
+  active BOOLEAN DEFAULT true,
+  sort INTEGER DEFAULT 0,
+  created_at TIMESTAMPTZ DEFAULT now(),
+  updated_at TIMESTAMPTZ DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS live_sessions (
+  id BIGSERIAL PRIMARY KEY,
+  title TEXT NOT NULL,
+  description TEXT DEFAULT '',
+  scheduled_at TIMESTAMPTZ,
+  duration_min INTEGER DEFAULT 60,
+  price_kes INTEGER DEFAULT 0,
+  status TEXT DEFAULT 'scheduled',
+  live_at TIMESTAMPTZ,
+  ended_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_live_sessions_status ON live_sessions(status, scheduled_at);
+CREATE TABLE IF NOT EXISTS live_bookings (
+  id BIGSERIAL PRIMARY KEY,
+  session_id BIGINT REFERENCES live_sessions(id) ON DELETE CASCADE,
+  loginid TEXT,
+  full_name TEXT NOT NULL,
+  email TEXT NOT NULL,
+  account TEXT DEFAULT '',
+  ticket TEXT UNIQUE NOT NULL,
+  status TEXT DEFAULT 'booked',
+  paystack_ref TEXT DEFAULT '',
+  amount_paid_kes INTEGER DEFAULT 0,
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_live_bookings_session ON live_bookings(session_id, created_at DESC);
 `;
 
 async function initDb() {
@@ -201,6 +298,9 @@ async function initDb() {
     await db.query('ALTER TABLE circles ADD COLUMN IF NOT EXISTS banner TEXT');
     await db.query('ALTER TABLE bots ADD COLUMN IF NOT EXISTS banner TEXT');
     await db.query('ALTER TABLE copy_strategies ADD COLUMN IF NOT EXISTS banner TEXT');
+    await db.query('ALTER TABLE live_sessions ADD COLUMN IF NOT EXISTS price_kes INTEGER DEFAULT 0');
+    await db.query("ALTER TABLE live_bookings ADD COLUMN IF NOT EXISTS paystack_ref TEXT DEFAULT ''");
+    await db.query('ALTER TABLE live_bookings ADD COLUMN IF NOT EXISTS amount_paid_kes INTEGER DEFAULT 0');
     console.log('[db] connected — schema ready');
   } catch (e) {
     console.error('[db] init failed:', e.message);
@@ -313,6 +413,14 @@ const pendingAuth = new Map(); // state -> { verifier, expiresAt }
 
 function randomBase64Url(bytes) {
   return crypto.randomBytes(bytes).toString('base64url');
+}
+
+// Voucher code for a booked live session, e.g. PFX-3K7M-9Q2L. Ambiguous
+// characters (0/O, 1/I/L) are excluded so tickets are easy to retype.
+function genTicket() {
+  const alphabet = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+  const seg = () => Array.from({ length: 4 }, () => alphabet[crypto.randomInt(alphabet.length)]).join('');
+  return `PFX-${seg()}-${seg()}`;
 }
 
 function sha256Base64Url(input) {
@@ -1103,6 +1211,178 @@ app.get('/api/activity', async (req, res) => {
   }
 });
 
+// --- Promotions (published by the admin console) ---
+app.get('/api/promotions', async (req, res) => {
+  if (!db) return res.status(503).json({ error: 'Database not configured' });
+  try {
+    const { rows } = await db.query(
+      'SELECT id, tag, tag_color, title, copy, image, link FROM promotions WHERE active ORDER BY sort, created_at DESC LIMIT 50'
+    );
+    res.json({ promotions: rows });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// --- Live sessions (broadcasts) ---
+app.get('/api/live/sessions', async (req, res) => {
+  if (!db) return res.status(503).json({ error: 'Database not configured' });
+  try {
+    const { rows } = await db.query(
+      `SELECT s.id, s.title, s.description, s.scheduled_at, s.duration_min, s.status,
+              s.live_at, s.ended_at, s.created_at, s.price_kes,
+              COUNT(b.id)::int AS bookings
+         FROM live_sessions s
+         LEFT JOIN live_bookings b ON b.session_id = s.id
+        WHERE s.status <> 'cancelled'
+        GROUP BY s.id
+        ORDER BY (s.status = 'live') DESC, s.scheduled_at ASC`
+    );
+    res.json({ sessions: rows });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Book a live session; the server generates a unique voucher ticket that the
+// holder must present in the Live tab to join the broadcast. Paid sessions
+// (price_kes > 0) create a pending booking, initialize a Paystack payment,
+// and return the Paystack checkout URL; the ticket is only issued once the
+// payment has been verified (see /api/live/pay/verify).
+app.post('/api/live/sessions/:id/book', async (req, res) => {
+  if (!db) return res.status(503).json({ error: 'Database not configured' });
+  const sessionId = Number(req.params.id);
+  const { full_name, email, account, callback_url } = req.body || {};
+  if (!sessionId) return res.status(400).json({ error: 'Missing session id' });
+  if (!full_name || !email) return res.status(400).json({ error: 'Name and email are required' });
+  try {
+    const sess = await db.query(
+      "SELECT id, status, price_kes FROM live_sessions WHERE id = $1 AND status IN ('scheduled', 'live')",
+      [sessionId]
+    );
+    if (!sess.rows.length) return res.status(400).json({ error: 'This live session is not accepting bookings' });
+    const session = sess.rows[0];
+    const priceKes = Math.max(0, parseInt(session.price_kes, 10) || 0);
+    const loginid = sessionLoginid(req) || null;
+
+    const existing = await db.query(
+      'SELECT id, ticket, status, paystack_ref FROM live_bookings WHERE session_id = $1 AND email ILIKE $2 LIMIT 1',
+      [sessionId, email]
+    );
+
+    if (priceKes > 0) {
+      if (!PAYSTACK_SECRET_KEY) {
+        return res.status(503).json({ error: 'Payments are not configured for this session yet.' });
+      }
+      if (existing.rows.length && existing.rows[0].status === 'booked') {
+        return res.json({ ok: true, ticket: existing.rows[0].ticket, existing: true });
+      }
+      const ref = `PFXPAY-${crypto.randomBytes(12).toString('hex').toUpperCase()}`;
+      let bookingId = existing.rows.length ? existing.rows[0].id : null;
+      if (!bookingId) {
+        const ins = await db.query(
+          `INSERT INTO live_bookings (session_id, loginid, full_name, email, account, ticket, status, paystack_ref, amount_paid_kes)
+           VALUES ($1, $2, $3, $4, $5, $6, 'pending_payment', $7, $8) RETURNING id`,
+          [sessionId, loginid, String(full_name).slice(0, 120), String(email).slice(0, 254),
+           String(account || '').slice(0, 64), genTicket(), ref, priceKes]
+        );
+        bookingId = ins.rows[0].id;
+      } else {
+        await db.query(
+          "UPDATE live_bookings SET paystack_ref = $2, amount_paid_kes = $3, status = 'pending_payment' WHERE id = $1",
+          [bookingId, ref, priceKes]
+        );
+      }
+      const cbUrl = typeof callback_url === 'string' && callback_url.length < 1000
+        ? callback_url : `${FRONTEND_URL}/`;
+      const pay = await paystackInitialize({ email, amountKes: priceKes, reference: ref, callbackUrl: cbUrl });
+      return res.json({
+        ok: true,
+        payment: {
+          url: pay.authorization_url,
+          reference: ref,
+          amount: priceKes,
+          currency: 'KES',
+        },
+      });
+    }
+
+    if (existing.rows.length) {
+      return res.json({ ok: true, ticket: existing.rows[0].ticket, existing: true });
+    }
+    const ins = await db.query(
+      `INSERT INTO live_bookings (session_id, loginid, full_name, email, account, ticket)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, ticket, created_at`,
+      [sessionId, loginid, String(full_name).slice(0, 120), String(email).slice(0, 254), String(account || '').slice(0, 64), genTicket()]
+    );
+    res.json({ ok: true, ticket: ins.rows[0].ticket, existing: false });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Verify a Paystack payment for a pending live booking and issue the ticket.
+// The browser is redirected back to the SPA with `?reference=...` after paying;
+// the SPA calls this to confirm before showing the voucher.
+app.post('/api/live/pay/verify', async (req, res) => {
+  if (!db) return res.status(503).json({ error: 'Database not configured' });
+  if (!PAYSTACK_SECRET_KEY) return res.status(503).json({ error: 'Payments are not configured' });
+  const reference = String((req.body || {}).reference || '').trim();
+  if (!reference) return res.status(400).json({ error: 'Payment reference is required' });
+  try {
+    const { rows } = await db.query(
+      'SELECT id, session_id, ticket, status FROM live_bookings WHERE paystack_ref = $1',
+      [reference]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Payment reference not found' });
+    const booking = rows[0];
+    if (booking.status === 'booked') {
+      return res.json({ ok: true, ticket: booking.ticket, session_id: booking.session_id });
+    }
+    const ver = await paystackVerify(reference);
+    if (ver.status && ver.data && ver.data.status === 'success') {
+      await db.query("UPDATE live_bookings SET status = 'booked' WHERE id = $1", [booking.id]);
+      return res.json({ ok: true, ticket: booking.ticket, session_id: booking.session_id });
+    }
+    res.status(402).json({ error: 'Payment was not completed.' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Validate a ticket voucher and admit the viewer into the live room.
+app.post('/api/live/join', async (req, res) => {
+  if (!db) return res.status(503).json({ error: 'Database not configured' });
+  const ticket = String((req.body || {}).ticket || '').trim().toUpperCase();
+  if (!ticket) return res.status(400).json({ error: 'Ticket code is required' });
+  try {
+    const { rows } = await db.query(
+      `SELECT b.id AS booking_id, b.ticket, b.status AS booking_status,
+              s.id AS session_id, s.title, s.status AS session_status
+         FROM live_bookings b
+         JOIN live_sessions s ON s.id = b.session_id
+        WHERE b.ticket = $1`,
+      [ticket]
+    );
+    if (!rows.length) return res.status(401).json({ error: 'Invalid ticket code' });
+    const row = rows[0];
+    if (row.session_status !== 'live') {
+      return res.status(409).json({ error: 'This broadcast is not live yet. Wait for the host to go live.' });
+    }
+    if (row.booking_status === 'joined') {
+      return res.json({ ok: true, session: { id: row.session_id, title: row.title }, alreadyJoined: true });
+    }
+    await db.query("UPDATE live_bookings SET status = 'joined' WHERE id = $1", [row.booking_id]);
+    res.json({ ok: true, session: { id: row.session_id, title: row.title } });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/live/ice', (req, res) => {
+  res.json({ iceServers: RTC_ICE_SERVERS });
+});
+
 // --- Circles ---
 app.get('/api/circles', async (req, res) => {
   if (!db) return res.status(503).json({ error: 'Database not configured' });
@@ -1642,19 +1922,39 @@ function uploadToCloudinary(dataUrl) {
     });
 }
 
+// Validate + decode a base64 image data URL. Returns null when invalid or
+// larger than maxBytes; otherwise the decoded buffer and the original URL.
+function parseImageDataUrl(data, maxBytes) {
+  if (!data || typeof data !== 'string') return null;
+  const m = /^data:(image\/[a-z0-9.+-]+);base64,([A-Za-z0-9+/=]+)$/.exec(data);
+  if (!m) return null;
+  const raw = Buffer.from(m[2], 'base64');
+  if (!raw.length || raw.length > maxBytes) return null;
+  return { mime: m[1], raw, dataUrl: data };
+}
+
 app.post('/api/upload', async (req, res) => {
   const loginid = sessionLoginid(req);
   if (!loginid) return res.status(401).json({ error: 'Not authenticated' });
-  const { data } = req.body || {};
-  if (!data || typeof data !== 'string') return res.status(400).json({ error: 'Missing image data' });
-  const m = /^data:(image\/[a-z0-9.+-]+);base64,([A-Za-z0-9+/=]+)$/.exec(data);
-  if (!m) return res.status(400).json({ error: 'Image must be a base64 data URL' });
-  const raw = Buffer.from(m[2], 'base64');
-  if (!raw.length) return res.status(400).json({ error: 'Empty image data' });
-  if (raw.length > 800 * 1024) return res.status(400).json({ error: 'Image too large (max 800 KB)' });
-  if (!CLOUDINARY_PARTS) return res.json({ url: data }); // dev fallback
+  const parsed = parseImageDataUrl((req.body || {}).data, 800 * 1024);
+  if (!parsed) return res.status(400).json({ error: 'Image must be a base64 data URL (max 800 KB)' });
+  if (!CLOUDINARY_PARTS) return res.json({ url: parsed.dataUrl }); // dev fallback
   try {
-    const url = await uploadToCloudinary(data);
+    const url = await uploadToCloudinary(parsed.dataUrl);
+    res.json({ url });
+  } catch (e) {
+    res.status(502).json({ error: e.message });
+  }
+});
+
+// Admin banner uploads (e.g. promotion images). Same Cloudinary path as the
+// user-facing uploader but gated on the admin token and allowed up to 5 MB.
+app.post('/api/admin/upload', requireAdmin, async (req, res) => {
+  const parsed = parseImageDataUrl((req.body || {}).data, 5 * 1024 * 1024);
+  if (!parsed) return res.status(400).json({ error: 'Image must be a base64 data URL (max 5 MB)' });
+  if (!CLOUDINARY_PARTS) return res.json({ url: parsed.dataUrl }); // dev fallback
+  try {
+    const url = await uploadToCloudinary(parsed.dataUrl);
     res.json({ url });
   } catch (e) {
     res.status(502).json({ error: e.message });
@@ -2440,10 +2740,15 @@ app.delete('/api/admin/users/:loginid', requireAdmin, async (req, res) => {
 app.get('/api/admin/activities', requireAdmin, async (req, res) => {
   if (!(await requireDb(res))) return;
   const limit = Math.min(parseInt(req.query.limit || '100', 10) || 100, 500);
+  const search = String(req.query.search || '').trim().slice(0, 100);
   try {
     const { rows } = await db.query(
-      'SELECT id, loginid, type, detail, created_at FROM activities ORDER BY created_at DESC LIMIT $1',
-      [limit]
+      `SELECT id, loginid, type, detail, created_at FROM activities
+        WHERE $1 = '' OR loginid ILIKE '%' || $1 || '%'
+           OR type ILIKE '%' || $1 || '%'
+           OR created_at::text ILIKE '%' || $1 || '%'
+        ORDER BY created_at DESC LIMIT $2`,
+      [search, limit]
     );
     res.json({ activities: rows });
   } catch (e) {
@@ -2564,6 +2869,186 @@ app.get('/api/admin/trades', requireAdmin, async (req, res) => {
   }
 });
 
+// --- Admin: promotions ---
+app.get('/api/admin/promotions', requireAdmin, async (req, res) => {
+  if (!(await requireDb(res))) return;
+  try {
+    const { rows } = await db.query(
+      'SELECT id, tag, tag_color, title, copy, image, link, active, sort, created_at, updated_at FROM promotions ORDER BY sort, created_at DESC LIMIT 500'
+    );
+    res.json({ promotions: rows });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/admin/promotions', requireAdmin, async (req, res) => {
+  if (!(await requireDb(res))) return;
+  const { tag, tag_color, title, copy, image, link, active, sort } = req.body || {};
+  if (!title) return res.status(400).json({ error: 'Title is required' });
+  if (image && String(image).startsWith('data:image/') && !parseImageDataUrl(image, 5 * 1024 * 1024)) {
+    return res.status(400).json({ error: 'Banner image must be a base64 data URL (max 5 MB)' });
+  }
+  try {
+    const { rows } = await db.query(
+      `INSERT INTO promotions (tag, tag_color, title, copy, image, link, active, sort)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       RETURNING id, tag, tag_color, title, copy, image, link, active, sort`,
+      [String(tag || 'OFFER').slice(0, 40), String(tag_color || '').slice(0, 20), String(title).slice(0, 160),
+       String(copy || '').slice(0, 1000), String(image || '').slice(0, 1000), String(link || '').slice(0, 1000),
+       active !== false, Math.min(parseInt(sort, 10) || 0, 10000)]
+    );
+    res.json({ promotion: rows[0] });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.put('/api/admin/promotions/:id', requireAdmin, async (req, res) => {
+  if (!(await requireDb(res))) return;
+  const id = Number(req.params.id);
+  const { tag, tag_color, title, copy, image, link, active, sort } = req.body || {};
+  if (!title) return res.status(400).json({ error: 'Title is required' });
+  if (image && String(image).startsWith('data:image/') && !parseImageDataUrl(image, 5 * 1024 * 1024)) {
+    return res.status(400).json({ error: 'Banner image must be a base64 data URL (max 5 MB)' });
+  }
+  try {
+    const { rows } = await db.query(
+      `UPDATE promotions SET tag = $2, tag_color = $3, title = $4, copy = $5, image = $6,
+              link = $7, active = $8, sort = $9, updated_at = now()
+        WHERE id = $1 RETURNING id, tag, tag_color, title, copy, image, link, active, sort`,
+      [id, String(tag || 'OFFER').slice(0, 40), String(tag_color || '').slice(0, 20), String(title).slice(0, 160),
+       String(copy || '').slice(0, 1000), String(image || '').slice(0, 1000), String(link || '').slice(0, 1000),
+       active !== false, Math.min(parseInt(sort, 10) || 0, 10000)]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Promotion not found' });
+    res.json({ promotion: rows[0] });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete('/api/admin/promotions/:id', requireAdmin, async (req, res) => {
+  if (!(await requireDb(res))) return;
+  try {
+    await db.query('DELETE FROM promotions WHERE id = $1', [Number(req.params.id)]);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// --- Admin: live sessions & bookings ---
+app.get('/api/admin/live/sessions', requireAdmin, async (req, res) => {
+  if (!(await requireDb(res))) return;
+  try {
+    const { rows } = await db.query(
+      `SELECT s.id, s.title, s.description, s.scheduled_at, s.duration_min, s.status,
+              s.live_at, s.ended_at, s.created_at, s.price_kes,
+              COUNT(b.id)::int AS bookings,
+              COUNT(b.id) FILTER (WHERE b.status = 'joined')::int AS joined
+         FROM live_sessions s
+         LEFT JOIN live_bookings b ON b.session_id = s.id
+        GROUP BY s.id
+        ORDER BY s.created_at DESC
+        LIMIT 500`
+    );
+    res.json({ sessions: rows });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/admin/live/sessions', requireAdmin, async (req, res) => {
+  if (!(await requireDb(res))) return;
+  const { title, description, scheduled_at, duration_min, price_kes } = req.body || {};
+  if (!title) return res.status(400).json({ error: 'Title is required' });
+  try {
+    const { rows } = await db.query(
+      `INSERT INTO live_sessions (title, description, scheduled_at, duration_min, price_kes)
+       VALUES ($1, $2, $3, $4, $5) RETURNING id, title, description, scheduled_at, duration_min, status, price_kes`,
+      [String(title).slice(0, 160), String(description || '').slice(0, 2000),
+       scheduled_at ? new Date(scheduled_at) : null, Math.min(Math.max(parseInt(duration_min, 10) || 60, 5), 1440),
+       Math.max(0, parseInt(price_kes, 10) || 0)]
+    );
+    res.json({ session: rows[0] });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.put('/api/admin/live/sessions/:id', requireAdmin, async (req, res) => {
+  if (!(await requireDb(res))) return;
+  const id = Number(req.params.id);
+  const { title, description, scheduled_at, duration_min, price_kes } = req.body || {};
+  try {
+    const { rows } = await db.query(
+      `UPDATE live_sessions SET title = $2, description = $3, scheduled_at = $4, duration_min = $5, price_kes = $6
+        WHERE id = $1 RETURNING id, title, description, scheduled_at, duration_min, status, price_kes`,
+      [id, String(title || '').slice(0, 160), String(description || '').slice(0, 2000),
+       scheduled_at ? new Date(scheduled_at) : null, Math.min(Math.max(parseInt(duration_min, 10) || 60, 5), 1440),
+       Math.max(0, parseInt(price_kes, 10) || 0)]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Live session not found' });
+    res.json({ session: rows[0] });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.put('/api/admin/live/sessions/:id/status', requireAdmin, async (req, res) => {
+  if (!(await requireDb(res))) return;
+  const id = Number(req.params.id);
+  const status = String((req.body || {}).status || '').trim();
+  if (!['scheduled', 'live', 'ended', 'cancelled'].includes(status)) {
+    return res.status(400).json({ error: 'Invalid status' });
+  }
+  try {
+    const { rows } = await db.query(
+      `UPDATE live_sessions SET status = $2,
+              live_at = CASE WHEN $2 = 'live' THEN COALESCE(live_at, now()) ELSE live_at END,
+              ended_at = CASE WHEN $2 = 'ended' THEN now() ELSE ended_at END
+        WHERE id = $1 RETURNING id, status, live_at, ended_at`,
+      [id, status]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Live session not found' });
+    res.json({ session: rows[0] });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete('/api/admin/live/sessions/:id', requireAdmin, async (req, res) => {
+  if (!(await requireDb(res))) return;
+  try {
+    await db.query('DELETE FROM live_sessions WHERE id = $1', [Number(req.params.id)]);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/admin/live/bookings', requireAdmin, async (req, res) => {
+  if (!(await requireDb(res))) return;
+  const sessionId = parseInt(req.query.session_id, 10);
+  const limit = Math.min(parseInt(req.query.limit || '300', 10) || 300, 1000);
+  try {
+    const { rows } = await db.query(
+      `SELECT b.id, b.session_id, s.title AS session_title, b.loginid, b.full_name, b.email,
+              b.account, b.ticket, b.status, b.created_at
+         FROM live_bookings b
+         JOIN live_sessions s ON s.id = b.session_id
+        WHERE ($1::bigint IS NULL OR b.session_id = $1)
+        ORDER BY b.created_at DESC
+        LIMIT $2`,
+      [sessionId || null, limit]
+    );
+    res.json({ bookings: rows });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // SPA fallback: serve index.html for any non-API route
 app.use((req, res) => {
   if (req.path.startsWith('/auth') || req.path.startsWith('/api')) {
@@ -2582,9 +3067,20 @@ const httpServer = app.listen(PORT, () => {
   console.log(`Deriv backend running on http://localhost:${PORT}`);
 });
 
-const wss = new WebSocketServer({ server: httpServer, path: '/ws' });
+const wss = new WebSocketServer({ server: httpServer });
 
 wss.on('connection', (ws, req) => {
+  let reqUrl;
+  try { reqUrl = new URL(req.url, `http://${req.headers.host}`); } catch { reqUrl = null; }
+  if (reqUrl && reqUrl.pathname === '/ws/live') {
+    handleLiveSignaling(ws, reqUrl);
+    return;
+  }
+  if (!reqUrl || reqUrl.pathname !== '/ws') {
+    ws.close(4000, 'invalid path');
+    return;
+  }
+
   ws.isAlive = true;
   ws.on('pong', () => { ws.isAlive = true; });
 
@@ -2680,6 +3176,132 @@ wss.on('connection', (ws, req) => {
     if (balanceToken) releaseBalanceStream(balanceToken, balanceAccount, ws);
   });
 });
+
+// ---------------------------------------------------------------
+// Live screen-share signaling (WebRTC). The admin console connects
+// as the host (valid admin token) and shares its screen; users who
+// booked a live session connect as viewers (valid ticket voucher)
+// and receive the host's stream. Only signaling traffic (SDP offers,
+// answers, ICE candidates) flows through this server — media itself
+// is peer-to-peer WebRTC. These connections share the single `/ws`
+// WebSocketServer; the connection handler dispatches `/ws/live` here.
+// ---------------------------------------------------------------
+const liveRooms = new Map(); // `live:<sessionId>` -> Set<ws>
+const livePeer = new Map();  // ws -> { room, role: 'host'|'viewer' }
+
+function liveRoom(room) {
+  if (!liveRooms.has(room)) liveRooms.set(room, new Set());
+  return liveRooms.get(room);
+}
+
+function sendLive(ws, msg) {
+  if (ws && ws.readyState === ws.OPEN) ws.send(JSON.stringify(msg));
+}
+
+function notifyHostViewers(room) {
+  let host = null;
+  let viewers = 0;
+  for (const ws of liveRoom(room)) {
+    const p = livePeer.get(ws);
+    if (p.role === 'host') host = ws;
+    else if (p.role === 'viewer') viewers += 1;
+  }
+  if (host) sendLive(host, { type: 'viewers', count: viewers });
+}
+
+async function handleLiveSignaling(ws, url) {
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; });
+
+  const room = String(url.searchParams.get('room') || '').slice(0, 80);
+  if (!/^live-\d+$/.test(room)) {
+    ws.close(4000, 'invalid room');
+    return;
+  }
+
+  let role = null;
+  const token = url.searchParams.get('token');
+  const ticket = String(url.searchParams.get('ticket') || '').trim().toUpperCase();
+
+  if (token && verifyAdminToken(token)) {
+    role = 'host';
+  } else if (ticket && db) {
+    try {
+      const { rows } = await db.query(
+        "SELECT 1 FROM live_bookings b JOIN live_sessions s ON s.id = b.session_id WHERE b.ticket = $1 AND s.status = 'live'",
+        [ticket]
+      );
+      if (rows.length) role = 'viewer';
+    } catch { /* db error treated as unauthorized */ }
+  }
+
+  if (!role) {
+    ws.close(4401, 'unauthorized');
+    return;
+  }
+
+  livePeer.set(ws, { room, role });
+  liveRoom(room).add(ws);
+  sendLive(ws, { type: 'joined', role, room });
+  if (role === 'host') {
+    notifyHostViewers(room);
+  } else if (role === 'viewer') {
+    // Tell the host a viewer joined so it re-sends its offer (late joiners
+    // otherwise miss the original offer). Renegotiation is safe here because
+    // the host is the only side that ever offers.
+    for (const other of liveRoom(room)) {
+      const p = livePeer.get(other);
+      if (p && p.role === 'host') sendLive(other, { type: 'viewer_joined' });
+    }
+    notifyHostViewers(room);
+  }
+
+  ws.on('message', (raw) => {
+    let msg;
+    try { msg = JSON.parse(raw); } catch { return; }
+    if (!msg || typeof msg.type !== 'string') return;
+    const peer = livePeer.get(ws);
+    if (!peer) return;
+
+    const roomSet = liveRoom(peer.room);
+    if (peer.role === 'host') {
+      // Host -> viewers: offers and ICE candidates
+      if (msg.type === 'offer' || msg.type === 'candidate' || msg.type === 'host_status') {
+        for (const other of roomSet) {
+          if (other !== ws) sendLive(other, { ...msg, from: 'host' });
+        }
+      }
+    } else if (peer.role === 'viewer') {
+      // Viewer -> host: answers and ICE candidates
+      if (msg.type === 'answer' || msg.type === 'candidate') {
+        let host = null;
+        for (const other of roomSet) {
+          const p = livePeer.get(other);
+          if (p && p.role === 'host') host = other;
+        }
+        if (host) sendLive(host, { ...msg, from: 'viewer' });
+      }
+    }
+  });
+
+  ws.on('close', () => {
+    const peer = livePeer.get(ws);
+    if (peer) {
+      const roomSet = liveRoom(peer.room);
+      roomSet.delete(ws);
+      if (roomSet.size === 0) liveRooms.delete(peer.room);
+      // Tell everyone still in the room the host left / viewer count changed.
+      if (peer.role === 'host') {
+        for (const other of liveRooms.get(peer.room) || []) {
+          sendLive(other, { type: 'host_left' });
+        }
+      } else {
+        notifyHostViewers(peer.room);
+      }
+    }
+    livePeer.delete(ws);
+  });
+}
 
 // Ping clients so half-open browser connections get cleaned up.
 setInterval(() => {

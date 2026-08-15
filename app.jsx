@@ -5,13 +5,14 @@ import {
   GraduationCap, Calculator, BookOpen, Radio, Activity,
   RefreshCw, AlertTriangle, Moon, Sun, Monitor, Wallet,
   Search, Trophy, SlidersHorizontal, Check,
-  Shield, Zap, Eye, PlayCircle,
+  Shield, Zap, Eye, PlayCircle, Tv, Ticket, Download,
 } from 'lucide-react';
 import { createChart, AreaSeries, CandlestickSeries, ColorType, CrosshairMode, LineStyle, createSeriesMarkers } from 'lightweight-charts';
 import ClassesTab from './tabs/classes.jsx';
 import BotBuilderTab from './tabs/botbuilder.jsx';
 import RiskCalculatorTab from './tabs/risk.jsx';
 import TutorialsTab from './tabs/tutorials.jsx';
+import SplashScreen from './splash.jsx';
 
 const API_BASE = import.meta.env.VITE_API_BASE || '';
 const WS_BASE = API_BASE.replace(/^http/, 'ws');
@@ -43,6 +44,7 @@ const TABS = [
   { id: 'classes', label: 'Classes', icon: GraduationCap },
   { id: 'riskcalc', label: 'Risk Calculator', icon: Calculator },
   { id: 'tutorials', label: 'Tutorials', icon: BookOpen },
+  { id: 'live', label: 'Live', icon: Tv },
 ];
 
 const PROMOS = [
@@ -75,6 +77,7 @@ const PROMOS = [
 export default function App() {
   const [activeTab, setActiveTab] = useState('dashboard');
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [splashDone, setSplashDone] = useState(false);
   const [authModal, setAuthModal] = useState(false);
   const [cashierModal, setCashierModal] = useState(null); // { mode: 'deposit' | 'withdraw' }
 
@@ -228,6 +231,8 @@ export default function App() {
     <div className="app">
       <GlobalStyle />
 
+      {!splashDone && <SplashScreen onDone={() => setSplashDone(true)} />}
+
       <TopNav
         activeTab={activeTab}
         setActiveTab={setActiveTab}
@@ -253,6 +258,7 @@ export default function App() {
               balance={balance}
               onLogin={handleLogin}
               onOpenCashier={openCashier}
+              onGoLive={() => setActiveTab('live')}
             />
           )}
           {activeTab === 'builder' && (
@@ -318,6 +324,13 @@ export default function App() {
           {activeTab === 'classes' && <ClassesTab />}
           {activeTab === 'riskcalc' && <RiskCalculatorTab />}
           {activeTab === 'tutorials' && <TutorialsTab />}
+          {activeTab === 'live' && (
+            <LiveTab
+              sessionId={sessionId}
+              selectedAccount={selectedAccount}
+              onRequireAuth={() => setAuthModal(true)}
+            />
+          )}
         </main>
 
         {sidebarOpen && (
@@ -537,6 +550,7 @@ const THEME_OPTIONS = [
 function TopNav({ activeTab, setActiveTab, loggedIn, onLogin, onLogout, onOpenCashier, theme, setTheme }) {
   const [themeOpen, setThemeOpen] = useState(false);
   const themeRef = useRef(null);
+  const [installPrompt, setInstallPrompt] = useState(null);
 
   useEffect(() => {
     const onDown = (e) => {
@@ -545,6 +559,27 @@ function TopNav({ activeTab, setActiveTab, loggedIn, onLogin, onLogout, onOpenCa
     document.addEventListener('mousedown', onDown);
     return () => document.removeEventListener('mousedown', onDown);
   }, []);
+
+  useEffect(() => {
+    const onPrompt = (e) => {
+      e.preventDefault();
+      setInstallPrompt(e);
+    };
+    const onInstalled = () => setInstallPrompt(null);
+    window.addEventListener('beforeinstallprompt', onPrompt);
+    window.addEventListener('appinstalled', onInstalled);
+    return () => {
+      window.removeEventListener('beforeinstallprompt', onPrompt);
+      window.removeEventListener('appinstalled', onInstalled);
+    };
+  }, []);
+
+  const handleInstall = async () => {
+    if (!installPrompt) return;
+    installPrompt.prompt();
+    await installPrompt.userChoice;
+    setInstallPrompt(null);
+  };
 
   const currentTheme = THEME_OPTIONS.find((o) => o.id === theme) || THEME_OPTIONS[0];
   const ThemeIcon = currentTheme.icon;
@@ -559,6 +594,11 @@ function TopNav({ activeTab, setActiveTab, loggedIn, onLogin, onLogout, onOpenCa
         </div>
 
         <div className="topnav-actions">
+          {installPrompt && (
+            <button className="btn-ghost install-btn" onClick={handleInstall} title="Install PronoFX Dbot">
+              <Download size={15} /> <span>Install</span>
+            </button>
+          )}
           {!loggedIn ? (
             <>
               <button className="btn-ghost" onClick={() => onLogin('login')}>Log in</button>
@@ -628,99 +668,416 @@ function TopNav({ activeTab, setActiveTab, loggedIn, onLogin, onLogout, onOpenCa
 
 // ---------------- Campaigns ----------------
 
-function CampaignsTab() {
-  const [view, setView] = useState('promotions');
-  const [sent, setSent] = useState(false);
-
-  const handleSubmit = (e) => {
-    e.preventDefault();
-    setSent(true);
+function Voucher({ ticket, onDone }) {
+  const [copied, setCopied] = useState(false);
+  const copyCode = async () => {
+    try {
+      await navigator.clipboard.writeText(ticket);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch { /* clipboard unavailable */ }
   };
+  return (
+    <div className="voucher">
+      <div className="voucher-mark"><Ticket size={26} /></div>
+      <div className="voucher-title">Your ticket is ready!</div>
+      <div className="voucher-code">{ticket}</div>
+      <p className="voucher-note">Keep this code — when the broadcast goes live, enter it in the <strong>Live</strong> tab to join.</p>
+      <div className="voucher-actions">
+        <button className="btn-outline btn-small" onClick={copyCode}>{copied ? 'Copied!' : 'Copy code'}</button>
+        <button className="btn-primary btn-small" onClick={onDone}>Done</button>
+      </div>
+    </div>
+  );
+}
+
+function saveTicket(sessionId, ticket) {
+  try {
+    const map = JSON.parse(localStorage.getItem('pronofx_tickets') || '{}');
+    map[sessionId] = ticket;
+    localStorage.setItem('pronofx_tickets', JSON.stringify(map));
+  } catch { /* private mode */ }
+}
+
+function getTickets() {
+  try { return JSON.parse(localStorage.getItem('pronofx_tickets') || '{}'); } catch { return {}; }
+}
+
+function BookSessionForm({ liveSession, account }) {
+  const [name, setName] = useState('');
+  const [email, setEmail] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+  const [ticket, setTicket] = useState(null);
+  const [redirecting, setRedirecting] = useState(false);
+
+  const paid = (liveSession.price_kes || 0) > 0;
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await fetch(`${API_BASE}/api/live/sessions/${liveSession.id}/book`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          full_name: name,
+          email,
+          account: account || '',
+          callback_url: `${window.location.origin}${window.location.pathname}`,
+        }),
+      });
+      const body = await res.json();
+      if (!res.ok) throw new Error(body.error || 'Booking failed');
+      if (body.payment && body.payment.url) {
+        // Paid session — hand off to Paystack; the ticket is issued after
+        // payment via the ?reference= callback handled by the app shell.
+        setRedirecting(true);
+        window.location.href = body.payment.url;
+        return;
+      }
+      setTicket(body.ticket);
+      saveTicket(liveSession.id, body.ticket);
+    } catch (err) { setError(err.message); } finally { setBusy(false); }
+  };
+
+  if (ticket) return <Voucher ticket={ticket} onDone={() => setTicket(null)} />;
+
+  if (redirecting) {
+    return (
+      <div className="booking-done">
+        <div className="booking-done-mark">↗</div>
+        <div className="booking-title">Redirecting to payment…</div>
+        <p>You'll be taken to Paystack to pay <strong>KES {Number(liveSession.price_kes).toLocaleString()}</strong>. After payment you'll return here with your ticket.</p>
+      </div>
+    );
+  }
+
+  return (
+    <form className="booking-form" onSubmit={submit}>
+      {paid && (
+        <div className="booking-session-info">
+          <div className="live-price-tag" style={{ alignSelf: 'flex-start' }}>
+            <strong>KES {Number(liveSession.price_kes).toLocaleString()}</strong>
+          </div>
+          <span className="mt-hint">This session costs KES {Number(liveSession.price_kes).toLocaleString()}. Pay securely via Paystack (M-Pesa / card) to receive your ticket.</span>
+        </div>
+      )}
+      <label className="booking-field">
+        <span>Full name</span>
+        <input className="booking-input" type="text" placeholder="e.g. Jane Mwangi" value={name} onChange={(e) => setName(e.target.value)} required />
+      </label>
+      <label className="booking-field">
+        <span>Email address</span>
+        <input className="booking-input" type="email" placeholder="you@example.com" value={email} onChange={(e) => setEmail(e.target.value)} required />
+      </label>
+      <label className="booking-field">
+        <span>Deriv account (optional)</span>
+        <input className="booking-input" type="text" placeholder="e.g. CR12345678" value={account || ''} readOnly={!!account} />
+      </label>
+      {error && <div className="mt-error">{error}</div>}
+      <button className="btn-primary booking-submit" type="submit" disabled={busy}>
+        {busy ? (paid ? 'Starting payment…' : 'Booking…') : paid ? `Pay KES ${Number(liveSession.price_kes).toLocaleString()} & get ticket` : 'Book & get my ticket'}
+      </button>
+    </form>
+  );
+}
+
+function CampaignsTab({ sessionId, selectedAccount, onRequireAuth, onGoLive }) {
+  const [promos, setPromos] = useState(null); // null = loading, [] = none
+  const [promoError, setPromoError] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch(`${API_BASE}/api/promotions`)
+      .then((r) => (r.ok ? r.json() : Promise.reject()))
+      .then((d) => { if (!cancelled) setPromos(d.promotions || []); })
+      .catch(() => { if (!cancelled) { setPromos(PROMOS); setPromoError('Offline — showing saved promotions.'); } });
+    return () => { cancelled = true; };
+  }, []);
 
   return (
     <div className="section">
       <div className="section-head">
-        <div className="pill-row">
-          <button
-            className={`pill ${view === 'promotions' ? 'pill-active' : ''}`}
-            onClick={() => { setView('promotions'); setSent(false); }}
-          >
-            Promotions
-          </button>
-          <button
-            className={`pill ${view === 'booking' ? 'pill-active' : ''}`}
-            onClick={() => { setView('booking'); setSent(false); }}
-          >
-            Book a Live Session
-          </button>
-        </div>
+        <h3 className="section-title" style={{ fontSize: 16, margin: '0 0 16px' }}>Promotions</h3>
       </div>
 
-      {view === 'promotions' && (
-        <div className="promo-row">
-          {PROMOS.map((p) => (
-            <div className="promo-card" key={p.id}>
-              <div className="promo-img" style={{ backgroundImage: `url(${p.img})` }}>
-                <span className="promo-tag" style={{ background: p.tagColor }}>{p.tag}</span>
-              </div>
-              <div className="promo-body">
-                <h3>{p.title}</h3>
-                <p>{p.copy}</p>
-                <button className="btn-outline">View strategy</button>
-              </div>
+      <div className="promo-row">
+        {promos === null && <div className="mt-hint">Loading promotions…</div>}
+        {promos && promos.length === 0 && <div className="mt-hint">No promotions right now — check back soon.</div>}
+        {promos && promos.map((p) => (
+          <div className="promo-card" key={p.id}>
+            <div className="promo-img" style={{ backgroundImage: `url(${p.image || 'https://picsum.photos/seed/promo' + p.id + '/640/420'})` }}>
+              <span className="promo-tag" style={{ background: p.tag_color || 'var(--accent-red)' }}>{p.tag}</span>
             </div>
-          ))}
+            <div className="promo-body">
+              <h3>{p.title}</h3>
+              <p>{p.copy}</p>
+              {p.link && <a className="btn-outline" href={p.link} target="_blank" rel="noopener noreferrer">View strategy</a>}
+              {!p.link && <button className="btn-outline" onClick={onGoLive}>Book a live session</button>}
+            </div>
+          </div>
+        ))}
+        {promoError && <div className="mt-hint">{promoError}</div>}
+      </div>
+    </div>
+  );
+}
+
+// ---------------- Live (screen-share broadcasts) ----------------
+
+// Viewer side of a WebRTC screen-share. Connects to the signaling socket
+// with the ticket voucher and renders the host's stream once connected.
+function LiveViewer({ session, ticket, onExit }) {
+  const videoRef = useRef(null);
+  const [status, setStatus] = useState('connecting'); // connecting | live | ended
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    let pc = null;
+    let ws = null;
+    let closed = false;
+
+    const send = (msg) => { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg)); };
+
+    const connect = async () => {
+      setStatus('connecting');
+      setError(null);
+      try {
+        const iceRes = await fetch(`${API_BASE}/api/live/ice`);
+        const ice = iceRes.ok ? (await iceRes.json()).iceServers || [] : [];
+        pc = new RTCPeerConnection({ iceServers: ice });
+        pc.ontrack = (ev) => {
+          if (videoRef.current) {
+            videoRef.current.srcObject = ev.streams[0] || new MediaStream([ev.track]);
+            videoRef.current.play().catch(() => {});
+            setStatus('live');
+          }
+        };
+        pc.onicecandidate = (ev) => { if (ev.candidate) send({ type: 'candidate', candidate: ev.candidate }); };
+
+        ws = new WebSocket(`${WS_BASE}/ws/live?room=live-${session.id}&ticket=${encodeURIComponent(ticket)}`);
+        ws.onmessage = async (ev) => {
+          let msg;
+          try { msg = JSON.parse(ev.data); } catch { return; }
+          if (msg.type === 'offer') {
+            try {
+              await pc.setRemoteDescription(msg.sdp);
+              const answer = await pc.createAnswer();
+              await pc.setLocalDescription(answer);
+              send({ type: 'answer', sdp: pc.localDescription });
+            } catch (e) { setError(`Could not join the broadcast: ${e.message}`); }
+          } else if (msg.type === 'candidate' && pc && msg.candidate) {
+            try { await pc.addIceCandidate(msg.candidate); } catch { /* out of order is fine */ }
+          } else if (msg.type === 'host_left') {
+            if (!closed) setStatus('ended');
+          }
+        };
+        ws.onclose = () => { if (!closed) setStatus('ended'); };
+        ws.onerror = () => { if (!closed) setError('Signaling connection failed — retrying not available; try leaving and rejoining.'); };
+      } catch (e) {
+        setError(e.message);
+      }
+    };
+
+    connect();
+
+    return () => {
+      closed = true;
+      if (pc) { try { pc.close(); } catch { /* noop */ } }
+      if (ws) { try { ws.close(); } catch { /* noop */ } }
+    };
+  }, [session.id, ticket]);
+
+  const liveLabel = status === 'live' ? 'Live' : status === 'connecting' ? 'Connecting…' : 'Broadcast ended';
+
+  return (
+    <div className="live-stage-wrap">
+      <div className="live-stage-head">
+        <div className="live-stage-title">
+          <span className={`tv-status ${status === 'live' ? 'tv-live' : status === 'connecting' ? 'tv-connecting' : 'tv-offline'}`}>
+            <Radio size={13} /> {liveLabel}
+          </span>
+          <strong>{session.title}</strong>
+        </div>
+        <button className="btn-ghost" onClick={onExit}>Leave</button>
+      </div>
+      <div className="live-stage">
+        <video ref={videoRef} playsInline autoPlay controls={status === 'live'} className={status === 'live' ? 'live-video' : 'live-video dim'} />
+        {status !== 'live' && (
+          <div className="live-empty">
+            {status === 'ended' ? (
+              <>
+                <p>The broadcast has ended.</p>
+                <button className="btn-primary" onClick={onExit}>Back to Live</button>
+              </>
+            ) : (
+              <p>Waiting for the broadcast…</p>
+            )}
+          </div>
+        )}
+      </div>
+      {error && <div className="mt-error" style={{ marginTop: 10 }}>{error}</div>}
+    </div>
+  );
+}
+
+function LiveTab({ sessionId, selectedAccount, onRequireAuth }) {
+  const [sessions, setSessions] = useState([]);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+  const [bookingFor, setBookingFor] = useState(null);
+  const [ticketInput, setTicketInput] = useState('');
+  const [joinError, setJoinError] = useState(null);
+  const [joinBusy, setJoinBusy] = useState(false);
+  const [watching, setWatching] = useState(null);
+  const [, forceTick] = useState(0);
+
+  const myTickets = getTickets();
+
+  const load = () => {
+    setBusy(true);
+    setError(null);
+    fetch(`${API_BASE}/api/live/sessions`)
+      .then((r) => (r.ok ? r.json() : Promise.reject()))
+      .then((d) => setSessions(d.sessions || []))
+      .catch((e) => setError(e.message || 'Could not load live sessions.'))
+      .finally(() => setBusy(false));
+  };
+  useEffect(() => { load(); }, []);
+
+  const live = sessions.find((s) => s.status === 'live') || null;
+  const upcoming = sessions.filter((s) => s.status !== 'live');
+
+  const joinWith = async (ticketCode) => {
+    const code = String(ticketCode || '').trim().toUpperCase();
+    if (!code) return;
+    if (!live) { setJoinError('No broadcast is live right now.'); return; }
+    setJoinBusy(true);
+    setJoinError(null);
+    try {
+      const res = await fetch(`${API_BASE}/api/live/join`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ticket: code }),
+      });
+      const body = await res.json();
+      if (!res.ok) throw new Error(body.error || 'Could not join');
+      saveTicket(live.id, code);
+      setWatching({ session: live, ticket: code });
+      forceTick((v) => v + 1);
+    } catch (e) { setJoinError(e.message); } finally { setJoinBusy(false); }
+  };
+
+  return (
+    <div className="section">
+      <div className="chart-head">
+        <h2 className="section-title">Live Broadcasts</h2>
+        {live && <span className="tv-status tv-live"><Radio size={13} /> LIVE NOW</span>}
+        <button className="btn-outline btn-small" style={{ marginLeft: 'auto' }} onClick={load} disabled={busy}>
+          <RefreshCw size={13} /> Refresh
+        </button>
+      </div>
+
+      {error && <div className="mt-error" style={{ marginBottom: 12 }}>{error}</div>}
+
+      {watching && <LiveViewer session={watching.session} ticket={watching.ticket} onExit={() => setWatching(null)} />}
+
+      {!watching && live && (
+        <div className="card live-join-card">
+          <div className="live-join-head">
+            <div>
+              <div className="live-join-label"><span className="tv-status tv-live"><Radio size={13} /> ON AIR</span></div>
+              <h3 style={{ margin: '6px 0 2px' }}>{live.title}</h3>
+              <p className="mt-hint">{live.description}</p>
+              <p className="mt-hint">{live.scheduled_at ? new Date(live.scheduled_at).toLocaleString() : ''} · {live.duration_min} min · {live.bookings} booked</p>
+            </div>
+            <span className={`live-price-tag ${(live.price_kes || 0) > 0 ? 'live-price-paid' : 'live-price-free'}`}>
+              {(live.price_kes || 0) > 0 ? `KES ${Number(live.price_kes).toLocaleString()}` : 'FREE'}
+            </span>
+          </div>
+
+          {myTickets[live.id] ? (
+            <div className="live-join-row">
+              <p className="mt-hint">You have a ticket for this broadcast.</p>
+              <button className="btn-primary" onClick={() => joinWith(myTickets[live.id])} disabled={joinBusy}>
+                <Play size={14} /> Join live
+              </button>
+            </div>
+          ) : (
+            <>
+              <p className="mt-hint">This broadcast is for booked attendees. Enter your ticket voucher to join.</p>
+              <div className="live-join-row">
+                <input
+                  className="booking-input ticket-input"
+                  placeholder="e.g. PFX-3K7M-9Q2L"
+                  value={ticketInput}
+                  onChange={(e) => setTicketInput(e.target.value.toUpperCase())}
+                  onKeyDown={(e) => { if (e.key === 'Enter') joinWith(ticketInput); }}
+                />
+                <button className="btn-primary" onClick={() => joinWith(ticketInput)} disabled={joinBusy || !ticketInput.trim()}>
+                  {joinBusy ? 'Joining…' : 'Join with ticket'}
+                </button>
+              </div>
+              {joinError && <div className="mt-error" style={{ marginTop: 8 }}>{joinError}</div>}
+            </>
+          )}
         </div>
       )}
 
-      {view === 'booking' && (
-        <div className="booking-card">
-          <h3 className="booking-title">Book a Live Session</h3>
-          <p className="booking-sub">Reserve a one-on-one session with a strategy coach. We'll confirm your slot by email.</p>
+      {!watching && !live && upcoming.length === 0 && !busy && (
+        <div className="card empty-card">
+          <p>No live sessions scheduled yet. Book a session and you'll receive a ticket to join when it airs.</p>
+        </div>
+      )}
 
-          {sent ? (
-            <div className="booking-done">
-              <div className="booking-done-mark">✓</div>
-              <p><strong>Request received!</strong></p>
-              <p>Your session request has been sent. Check your email for confirmation within 24 hours.</p>
-              <button className="btn-ghost" onClick={() => setSent(false)}>Book another session</button>
-            </div>
-          ) : (
-            <form className="booking-form" onSubmit={handleSubmit}>
-              <label className="booking-field">
-                <span>Full name</span>
-                <input className="booking-input" type="text" placeholder="e.g. Jane Mwangi" required />
-              </label>
-              <label className="booking-field">
-                <span>Email address</span>
-                <input className="booking-input" type="email" placeholder="you@example.com" required />
-              </label>
-              <label className="booking-field">
-                <span>Deriv account (optional)</span>
-                <input className="booking-input" type="text" placeholder="e.g. CR12345678" />
-              </label>
-              <div className="booking-row">
-                <label className="booking-field">
-                  <span>Preferred date</span>
-                  <input className="booking-input" type="date" required />
-                </label>
-                <label className="booking-field">
-                  <span>Preferred time</span>
-                  <input className="booking-input" type="time" required />
-                </label>
+      {!watching && upcoming.length > 0 && (
+        <div className="live-list">
+          <h3 className="live-list-title">Upcoming sessions</h3>
+          {upcoming.map((s) => {
+            const booked = !!myTickets[s.id];
+            const paid = (s.price_kes || 0) > 0;
+            return (
+              <div className="live-session-card" key={s.id}>
+                <div className="live-session-info">
+                  <div className="live-session-title-row">
+                    <strong>{s.title}</strong>
+                    <span className={`live-price-tag ${paid ? 'live-price-paid' : 'live-price-free'}`}>
+                      {paid ? `KES ${Number(s.price_kes).toLocaleString()}` : 'FREE'}
+                    </span>
+                  </div>
+                  {s.description && <p className="mt-hint">{s.description}</p>}
+                  <p className="mt-hint">
+                    {s.scheduled_at ? new Date(s.scheduled_at).toLocaleString() : 'Date TBA'} · {s.duration_min} min · {s.bookings} booked
+                  </p>
+                </div>
+                <div className="live-session-actions">
+                  {booked ? (
+                    <button className="btn-ghost btn-small" onClick={() => setBookingFor(s)}>My ticket</button>
+                  ) : (
+                    <button className="btn-primary btn-small" onClick={() => setBookingFor(s)}>Book now</button>
+                  )}
+                </div>
               </div>
-              <label className="booking-field">
-                <span>Session type</span>
-                <select className="select">
-                  <option>Strategy review</option>
-                  <option>Bot building help</option>
-                  <option>Risk management basics</option>
-                  <option>Getting started walkthrough</option>
-                </select>
-              </label>
-              <button className="btn-primary booking-submit" type="submit">Request session</button>
-            </form>
-          )}
+            );
+          })}
+        </div>
+      )}
+
+      {bookingFor && (
+        <div className="modal-overlay" onClick={() => setBookingFor(null)}>
+          <div className="bot-modal" role="dialog" aria-modal="true" onClick={(e) => e.stopPropagation()}>
+            <div className="sidebar-topbar">
+              <div className="modal-title">Book — {bookingFor.title}</div>
+              <button className="btn-icon" onClick={() => setBookingFor(null)} aria-label="Close"><X size={16} /></button>
+            </div>
+            {myTickets[bookingFor.id] ? (
+              <Voucher ticket={myTickets[bookingFor.id]} onDone={() => setBookingFor(null)} />
+            ) : (
+              <BookSessionForm liveSession={bookingFor} account={selectedAccount} />
+            )}
+          </div>
         </div>
       )}
     </div>
@@ -729,7 +1086,7 @@ function CampaignsTab() {
 
 // ---------------- Dashboard ----------------
 
-function DashboardTab({ loggedIn, sessionId, accounts, selectedAccount, setSelectedAccount, balance, onLogin, onOpenCashier }) {
+function DashboardTab({ loggedIn, sessionId, accounts, selectedAccount, setSelectedAccount, balance, onLogin, onOpenCashier, onGoLive }) {
   const [history, setHistory] = useState(null);
   const [historyBusy, setHistoryBusy] = useState(false);
   const [days, setDays] = useState(7);
@@ -899,7 +1256,12 @@ function DashboardTab({ loggedIn, sessionId, accounts, selectedAccount, setSelec
       )}
 
       <div style={{ marginTop: 28 }}>
-        <CampaignsTab />
+        <CampaignsTab
+          sessionId={sessionId}
+          selectedAccount={selectedAccount}
+          onRequireAuth={() => onLogin('login')}
+          onGoLive={onGoLive}
+        />
       </div>
     </div>
   );
@@ -3990,6 +4352,8 @@ function GlobalStyle() {
       .btn-outline:hover { border-color: var(--accent-red); color: var(--accent-red); }
       .btn-small { padding: 5px 10px; font-size: 12px; }
       .btn-icon { background: var(--panel-2); border: 1px solid var(--border); color: var(--text-muted); border-radius: 8px; width: clamp(32px, 4vh, 38px); height: clamp(32px, 4vh, 38px); display: flex; align-items: center; justify-content: center; cursor: pointer; }
+      .install-btn { display: inline-flex; align-items: center; gap: 6px; border-color: rgba(0,208,160,0.4); color: var(--accent-teal); }
+      .install-btn:hover { border-color: var(--accent-teal); color: var(--accent-teal); background: rgba(0,208,160,0.08); }
 
       .body { display: flex; align-items: flex-start; }
       .main { flex: 1; min-width: 0; padding: 24px; }
@@ -4022,6 +4386,38 @@ function GlobalStyle() {
       .booking-done-mark { width: 48px; height: 48px; border-radius: 50%; background: rgba(0,208,160,0.12); color: var(--accent-teal); display: flex; align-items: center; justify-content: center; font-size: 22px; font-weight: 800; }
       .booking-done p { margin: 0; font-size: 13px; color: var(--text-muted); line-height: 1.6; }
       .booking-done button { margin-top: 6px; }
+
+      .mono { font-family: 'SFMono-Regular', Consolas, monospace; }
+      .booking-session-info { background: var(--panel-2); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; display: flex; flex-direction: column; gap: 4px; margin-bottom: 14px; }
+      .booking-session-info strong { font-size: 14px; }
+
+      .voucher { display: flex; flex-direction: column; align-items: center; gap: 8px; text-align: center; padding: 10px 4px; }
+      .voucher-mark { width: 54px; height: 54px; border-radius: 14px; background: linear-gradient(135deg, var(--accent-indigo), var(--accent-red)); color: #fff; display: flex; align-items: center; justify-content: center; }
+      .voucher-title { font-size: 16px; font-weight: 800; }
+      .voucher-code { font-family: 'SFMono-Regular', Consolas, monospace; font-size: 24px; font-weight: 800; letter-spacing: 0.08em; color: var(--accent-teal); background: rgba(0,208,160,0.1); border: 1px dashed rgba(0,208,160,0.5); border-radius: 10px; padding: 10px 18px; margin: 4px 0; }
+      .voucher-note { margin: 0; font-size: 13px; color: var(--text-muted); line-height: 1.6; max-width: 320px; }
+      .voucher-actions { display: flex; gap: 8px; margin-top: 6px; }
+
+      .live-join-card { display: flex; flex-direction: column; gap: 12px; max-width: 640px; }
+      .live-join-head { display: flex; gap: 14px; align-items: flex-start; }
+      .live-join-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+      .ticket-input { flex: 1; min-width: 220px; text-transform: uppercase; letter-spacing: 0.08em; font-family: 'SFMono-Regular', Consolas, monospace; }
+      .live-list { display: flex; flex-direction: column; gap: 10px; margin-top: 22px; }
+      .live-list-title { margin: 0 0 4px; font-size: 15px; }
+      .live-session-card { display: flex; align-items: center; gap: 12px; background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px; max-width: 640px; }
+      .live-session-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+      .live-session-info strong { font-size: 14px; }
+      .live-session-actions { flex-shrink: 0; }
+
+      .live-stage-wrap { display: flex; flex-direction: column; gap: 10px; }
+      .live-stage-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+      .live-stage-title { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+      .live-stage-title strong { font-size: 16px; }
+      .live-stage { position: relative; background: #000; border: 1px solid var(--border); border-radius: 14px; overflow: hidden; aspect-ratio: 16 / 9; width: 100%; max-width: 960px; }
+      .live-video { width: 100%; height: 100%; object-fit: contain; display: block; }
+      .live-video.dim { opacity: 0.25; }
+      .live-empty { position: absolute; inset: 0; display: flex; flex-direction: column; gap: 12px; align-items: center; justify-content: center; color: var(--text-muted); text-align: center; padding: 20px; }
+      .live-empty p { margin: 0; }
 
       .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 18px; }
       .card-label { font-size: 12px; color: var(--text-muted); margin-bottom: 8px; font-weight: 600; }
@@ -4415,6 +4811,7 @@ function GlobalStyle() {
         .brand-mark { width: 26px; height: 26px; font-size: 13px; }
         .brand-name { font-size: 15px; }
         .brand-badge { display: none; }
+        .install-btn span { display: none; }
         .main { padding: 14px; }
         .section-title { font-size: 18px; }
         .tabs { padding: 4px 10px 8px; min-height: clamp(42px, 6vh, 54px); }
